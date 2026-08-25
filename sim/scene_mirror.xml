@@ -1,0 +1,55 @@
+<mujoco model="so101_mirror">
+  <!-- 실팔 미러 씬 (2026-08-20): so101_new_calib(103 pick_n_place 판, graspframe·
+       fingertip 사이트 포함)를 그대로 쓰고, 책상·빨간 체스말은 mocap 몸체로 둬
+       sim_view.py 가 런타임에 실측 좌표(sim_frame.json 변환)로 배치한다.
+       미러는 mj_forward 만 쓰는 운동학 표시용 — mocap 지오메트리는 충돌 제외. -->
+  <include file="so101_new_calib.xml"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="150" elevation="-20" offwidth="1280" offheight="720"/>
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.9 0.93 0.96" rgb2="0.6 0.7 0.8"
+             width="512" height="3072"/>
+    <texture type="2d" name="ground_tx" builtin="checker" mark="edge"
+             rgb1="0.75 0.75 0.75" rgb2="0.65 0.65 0.65" markrgb="0.5 0.5 0.5"
+             width="300" height="300"/>
+    <material name="ground_mat" texture="ground_tx" texuniform="true"
+              texrepeat="5 5" reflectance="0.1"/>
+    <material name="desk_mat" rgba="0.72 0.58 0.42 1"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" directional="true"/>
+    <geom name="ground" type="plane" size="0 0 0.05" pos="0 0 -0.2"
+          material="ground_mat" contype="0" conaffinity="0"/>
+    <body name="desk" mocap="true" pos="0.3 0 0.17">
+      <geom name="desk_top" type="box" size="0.35 0.45 0.03" material="desk_mat"
+            contype="0" conaffinity="0"/>
+    </body>
+    <!-- 물체 프록시 둘 다 유지 (2026-08-20 저녁): 기본은 4×4cm 큐브,
+         체스말(원기둥 Ø22×70mm) 모드도 보존 — sim_view --piece 가 활성
+         프록시를 고르고 비활성은 지면 아래로 치운다 -->
+    <body name="piece" mocap="true" pos="0.35 0.15 0.25">
+      <geom name="piece_body" type="box" size="0.02 0.02 0.02"
+            rgba="0.85 0.10 0.10 1" contype="0" conaffinity="0"/>
+    </body>
+    <body name="piece_cyl" mocap="true" pos="0.8 0.8 -1.0">
+      <geom name="piece_cyl_body" type="cylinder" size="0.011 0.035"
+            rgba="0.85 0.10 0.10 1" contype="0" conaffinity="0"/>
+    </body>
+    <!-- 투하 상자: 검은 개방형 8×8cm × 높이 6.5cm, 방출 지점 패널
+         (0.042,-0.142) — 2026-08-20 저녁 사용자 제원. 원점은 바닥면 중심 -->
+    <body name="dropbox" mocap="true" pos="0.1808 -0.142 0.1844">
+      <geom name="box_bottom" type="box" size="0.04 0.04 0.002" pos="0 0 0.002"
+            rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <geom name="box_wall_y1" type="box" size="0.04 0.004 0.0325"
+            pos="0 0.036 0.0325" rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <geom name="box_wall_y2" type="box" size="0.04 0.004 0.0325"
+            pos="0 -0.036 0.0325" rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <geom name="box_wall_x1" type="box" size="0.004 0.032 0.0325"
+            pos="0.036 0 0.0325" rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <geom name="box_wall_x2" type="box" size="0.004 0.032 0.0325"
+            pos="-0.036 0 0.0325" rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>

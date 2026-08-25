@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+.omc/
+calib_backup_*.json
+_range_tmp.json
+handeye_invalid_*.json
