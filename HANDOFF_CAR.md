@@ -1,7 +1,8 @@
 # SO-101 Mobile Manipulation 차량 장착 인계 (2026-08-27)
 
-노트북에서 수집·학습, 최종 배포는 라즈베리파이. 팔은 JD-AMR 상판에 **클램프**로
-임시 고정(볼트 구멍 가공은 나중). 이 문서는 다른 세션이 이어받기 위한 현재 상태다.
+노트북이 손목캠·YOLO·ACT·SO-101·SLAM/Nav2를 맡고, Raspberry Pi 4는 베이스와
+센서 드라이버·명령 단절 정지를 맡는다. 팔은 JD-AMR 상판에 **클램프**로 임시 고정
+(볼트 구멍 가공은 나중). 이 문서는 다른 세션이 이어받기 위한 현재 상태다.
 
 정본 저장소: `~/so101-mobile-manipulation`
 
@@ -87,7 +88,8 @@
 - 벤치 데이터(so101_pick_pm 등)는 기하가 달라 **차량 학습에 섞지 말 것**
 - 학습: `lerobot-train --policy.type=act --policy.chunk_size=30`, 손목 뷰는 `make_wrist_view.py`
 - 실기: `act_run.py --replan 15` (청크 모드). 앙상블 모드는 맴돌기 유발
-- 파이 추론 예상 200~300ms/회 → `--replan 15`(1.5초)면 충분
+- 기존 Pi 단독 ACT 추론 예상 200~300ms/회는 참고값이다. 현재 기본 배치는
+  노트북 ACT 추론이며, `--replan 15` 청크 규약은 유지한다.
 
 ## 8-1. 현재 팔 상태 (2026-08-27 세션 종료 시점)
 
@@ -96,6 +98,41 @@
 - `pick_log.csv` 에 사이클 4건 기록(모두 실패). `analyze_log.py` 로 확인 가능
 - 105px 이탈은 화면 관찰값이며 현재 CSV에는 직접 기록되지 않았다.
 
+## 8-2. 연산 배치와 Pi 통신
+
+**노트북 중심 배치로 확정했다.** Pi 4에 YOLO·ACT·SLAM·Nav2까지 몰지 않는다.
+
+| 노트북 | Raspberry Pi 4 |
+|---|---|
+| 손목캠 MJPEG·YOLO·타깃 락 | 베이스 드라이버·ESP32 시리얼 |
+| SO-101 패널·IBVS·ACT | 라이다·IMU·오도메트리 발행 |
+| Cartographer·Nav2·고수준 상태머신 | 0.4초 `cmd_vel` 타임아웃·정지 |
+| 로그·학습·화면 | 하드웨어 상태·배터리 |
+
+- 노트북 ROS2 실기 환경: `ROS_DOMAIN_ID=12`, `ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET`,
+  `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`. `laptop_ros_env.sh`가 세 값을 고정하고,
+  낡은 `ROS_LOCALHOST_ONLY` 값은 제거한다. `jdamr.local`이 해석될 때만 정적 피어에
+  실제 IP를 넣는다. Pi IP를 직접 줄 때는 `ROS_STATIC_PEERS`가 아니라
+  `SO101_PI_PEER=<IP>`를 쓴다. 이전 세션의 잘못된 ROS 변수는 재사용하지 않는다.
+- 영상은 Pi로 보내지 않는다. Pi→노트북은 `/scan`·`/odom`·`/imu/data_raw`·배터리,
+  노트북→Pi는 Collision Monitor를 거친 최종 `/cmd_vel`만 보낸다.
+- 손목캠 YOLO는 `wrist_yolo.py`. 기존 `~/capstone_tools/yolo_cubes.pt`의
+  `blue_box`·`red_box`·`green_box`를 쓴다. 이 모델은 시뮬 데이터 기반이므로
+  실제 손목캠 조명·흔들림·거리에서 관측을 수집한 뒤 재평가해야 한다.
+- ✅ 2026-08-27 실제 손목캠 352×288로 첫 검증: 3프레임 중 3번째에서
+  `red_box` 신뢰도 0.933. 모델 냉시작 포함 첫 추론 2.76초, 이후 4.4~16.5ms였다.
+  표본 3개라 성능 판정값은 아니며, 주행 흔들림·거리별 관측을 더 모아야 한다.
+- `mobile_preflight.py`는 로봇 명령 publisher·제어 API 호출을 만들지 않는 점검기다.
+  rclpy의 `/parameter_events`·`/rosout` 메타데이터 발행은 존재한다. 손목캠과
+  `/scan`·`/odom`·배터리와 기대 ROS 그래프의 베이스 구독자를 확인한다.
+  `--require-motion-stack`은
+  `/cmd_vel` 최종 발행자가 `/collision_monitor` 하나인지도 확인한다.
+- 현재 프리플라이트에서 노트북 패널 연결·캘리브레이션·손목캠은 PASS했지만
+  `jdamr.local`이 해석되지 않아 Pi의 `/scan`·`/odom`·배터리·베이스 구독자는
+  미수신이다. Pi 전원·네트워크를 복구한 뒤 같은 도구로 재검증한다.
+- 주행과 팔 이동은 동시에 하지 않는다. YOLO로 탐색·접근 → `cmd_vel=0` →
+  오도메트리 정지 확인 → 베이스 잠금 → HSV+IBVS 파지 순서다.
+
 ## 9. 다음 단계
 
 1. ~~shoulder_pan 안전 범위 재측정~~ ✅ 완료 (2026-08-27, 중심 −15.6° ± 7.0°)
@@ -103,7 +140,10 @@
    5번 절차로 파지·관찰 기준을 다시 잡을 것. (팔을 손으로 옮긴 뒤라 기준이 어긋났다)
 3. 1사이클 검증 → 배치로 수집 확대 (목표 40~50 에피소드)
 4. 학습 → 실기 성공률 측정
-5. SLAM 연동: 차 회전 정렬은 **큐브가 회전중심에서 멀 때만** 유효 (car_align.py 참조)
+5. Pi 전원·네트워크·mDNS 복구 → 노트북↔Pi 읽기 전용 프리플라이트 재실행
+6. 주행 환경에서 실제 손목캠 YOLO 관측 수집·검출률 측정
+7. 주행 상태머신 연동: 차 회전 정렬은 **큐브가 회전중심에서 멀 때만** 유효
+   (`car_align.py` 참조). 비영점 주행은 정지·베이스 잠금 게이트를 먼저 구현한다.
 
 ## 10. 이 세션에서 바뀐 것 (2026-08-27)
 
@@ -119,3 +159,5 @@
   `car_align.py`, `aim.py`(높이 경고 포함)
 - `unfold_safe.py`를 연속 이동판으로 복원했다. 8° 안전 웨이포인트는 계산에만 쓰고,
   실제 팔에는 15Hz 궤적을 한 번 보낸다. `shoulder_lift`는 최대 6°/s 한 구간으로 이동한다.
+- 연산 배치를 **노트북 중심**으로 확정했다. `laptop_ros_env.sh`, 읽기 전용
+  `mobile_preflight.py`, 읽기 전용 `wrist_yolo.py`, 오프라인 테스트를 추가했다.

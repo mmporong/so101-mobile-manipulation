@@ -28,6 +28,55 @@ bash "$HOME/so101-mobile-manipulation/run_batch.sh" 1
 
 이 명령은 실물 팔을 움직입니다. 팬 충돌 범위와 교시값을 확인하지 않은 상태에서는 실행하지 마세요.
 
+## 노트북 중심 배치
+
+연산은 가능한 한 노트북에 둡니다. 노트북이 손목캠·YOLO·ACT·SO-101 제어와
+SLAM/Nav2를 맡고, Raspberry Pi 4는 베이스·라이다·IMU 드라이버와 로컬 명령
+타임아웃을 맡습니다. 영상은 Pi로 보내지 않으며 ROS2로 센서와 속도 명령만 교환합니다.
+
+```text
+손목캠 → 노트북(YOLO·파지·SLAM/Nav2) → ROS2 /cmd_vel → Pi → ESP32·모터
+                            ↑         /scan·/odom·/imu/data_raw ←┘
+SO-101 USB·패널 ────────────┘
+```
+
+노트북의 실기 ROS2 명령은 아래 래퍼로 실행합니다. 로봇 Domain 12와 Pi에서 확인된
+Fast DDS UDPv4 경로를 강제로 적용하고, `jdamr.local`이 해석되면 정적 피어 IP도
+자동으로 설정합니다. 강의실 AP에서 자동 발견이 안 되면 이전 ROS 환경변수를
+재사용하지 말고 프로젝트 전용 `SO101_PI_PEER=<Pi IP>`를 명시합니다.
+
+```bash
+bash "$HOME/so101-mobile-manipulation/laptop_ros_env.sh" ros2 topic list
+
+```
+
+실제 명령을 보내기 전 읽기 전용 프리플라이트를 실행합니다. 전체 주행 스택을 띄운
+뒤에는 `--require-motion-stack`으로 최종 `/cmd_vel` 발행자가 Collision Monitor
+하나뿐인지도 검사합니다.
+
+```bash
+bash "$HOME/so101-mobile-manipulation/laptop_ros_env.sh" \
+  python3 "$HOME/so101-mobile-manipulation/mobile_preflight.py"
+
+bash "$HOME/so101-mobile-manipulation/laptop_ros_env.sh" \
+  python3 "$HOME/so101-mobile-manipulation/mobile_preflight.py" \
+  --require-motion-stack
+```
+
+손목캠 YOLO 관찰기는 로봇 명령을 만들지 않습니다. 차량·팔 명령 없이 기존 큐브 모델을 먼저
+검증하고, 실제 프레임 관측을 JSON으로 남길 수 있습니다.
+
+```bash
+python3 "$HOME/so101-mobile-manipulation/wrist_yolo.py" --self-test
+python3 "$HOME/so101-mobile-manipulation/wrist_yolo.py" \
+  --target red_box --frames 100 \
+  --jsonl "$HOME/so101_datasets/wrist_yolo_observations.jsonl"
+```
+
+주행 중에는 차량만 움직이고 팔은 관찰 자세로 고정합니다. 파지는 반드시
+`cmd_vel=0`과 오도메트리 정지를 확인한 뒤 시작하며, 팔이 동작하는 동안 베이스
+명령 소유권을 잠그는 상태머신을 다음 통합 단계에서 연결합니다.
+
 ## 개발 환경
 
 - Linux와 Python 3.12

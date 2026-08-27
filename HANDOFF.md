@@ -407,6 +407,9 @@ POSES 는 돌출 4cm 실측 기준 아래층 -0.01(밑동-책상 28mm)·x 0.15~0
 | `~/so101-mobile-manipulation/handeye.py` | 정합 스크립트 (미검증) — 프리플라이트가 IK·범위·**바닥 여유**를 정적 검사 |
 | `~/so101-mobile-manipulation/floor_from_depth.py` | **비접촉** 바닥 측정 — 뎁스 `/points` 평면 피팅, 정합 후 로봇 z 환산 |
 | `~/so101-mobile-manipulation/unfold_safe.py` | 접힌 팔 펴기 — FK 안전 웨이포인트를 15Hz 연속 궤적으로 실행 |
+| `~/so101-mobile-manipulation/laptop_ros_env.sh` | 노트북↔Pi ROS2 실기 환경(Domain 12·SUBNET·UDPv4) 고정 |
+| `~/so101-mobile-manipulation/mobile_preflight.py` | 로봇 명령 없이 손목캠·센서·`cmd_vel` 소유권 점검 |
+| `~/so101-mobile-manipulation/wrist_yolo.py` | 노트북 손목캠 YOLO 관찰·JSONL 기록(이동 명령 없음) |
 | `~/so101-mobile-manipulation/collect_peaks.py` | 정상 이동 전류 피크 수집 (CURRENT_STOP 보정용) |
 | `~/so101-mobile-manipulation/servo_check.py` | 서보 진단 (읽기 전용) |
 | `~/so101-mobile-manipulation/servo_id.py` | 교체 서보 ID 부여 + 보호 설정 |
