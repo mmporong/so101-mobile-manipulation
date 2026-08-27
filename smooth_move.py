@@ -27,6 +27,7 @@ import arm_lib                                     # noqa: E402
 BASE = 'http://127.0.0.1:8765'
 J5 = arm_lib.JOINTS
 MARGIN_DEG = 2.6   # 패널 LIMIT_MARGIN_DEG(2.0)보다 커야 한다 — 작으면 경계 틱이 거부돼 지연 트립 (2026-08-25 파킹 실측)
+SMOOTHSTEP_MAX_SLOPE = 1.5
 
 
 def _post(op, timeout=3.0, **kw):
@@ -86,10 +87,14 @@ def plan(cur, waypoints, speed_dps=20.0, hz=15.0, speeds=None):
             q['shoulder_pan'] = float(lk)
     if speeds is None:
         speeds = [speed_dps] * (len(pts) - 1)
-    seg = [max(max(abs(b[j] - a[j]) for j in J5) / max(sp, 1.0), 1e-3)
+    # 전역 smoothstep의 최대 기울기는 1.5다. 구간 시간을 그만큼 늘려야
+    # `speeds`가 평균값이 아니라 실제 틱 속도의 상한이 된다.
+    seg = [max(max(abs(b[j] - a[j]) for j in J5)
+               / max(sp, 1.0) * SMOOTHSTEP_MAX_SLOPE, 1e-3)
            for (a, b), sp in zip(zip(pts, pts[1:]), speeds)]
     T = sum(seg)
-    n = max(2, int(T * hz))
+    # 내림하면 틱 간격이 짧아져 선언한 상한을 소수점 아래에서 넘을 수 있다.
+    n = max(2, math.ceil(T * hz))
     bnd = _bounds()
     ticks = []
     for i in range(n + 1):
@@ -122,35 +127,46 @@ def stream(ticks, hz=15.0, z_floor=None):
     아니라 **명령 궤적이 속도를 정의**한다 (2026-08-25 사용자 +50% 지시).
     끝나면 finally 로 안전 프로파일을 복원한다.
     """
+    if not ticks:
+        raise RuntimeError('빈 궤적은 실행할 수 없습니다')
+
     period = 1.0 / hz
-    gate_t = 0.0
-    prev_pos = None
-    # 무제한 전환을 **확인하고** 출발한다 (2026-08-25 파킹 지연 33° 트립 원인:
-    # 전환이 안 먹었는데 빠른 궤적을 흘리면 상한과의 격차가 지연으로 쌓인다).
-    try:
+
+    def required_state(stage):
+        try:
+            return _state()
+        except Exception as e:
+            raise RuntimeError(
+                f'{stage} 상태 읽기 실패: {type(e).__name__}') from e
+
+    def run_stream():
+        gate_t = 0.0
+        prev_pos = None
+        # 전환 요청의 HTTP 응답과 Worker 적용 상태를 둘 다 확인한다.
         _post('teleop_profile', on=True, timeout=10.0)
         for _ in range(12):
-            if _state().get('teleop'):
+            if required_state('무제한 프로파일 확인').get('teleop'):
                 break
             time.sleep(0.5)
         else:
             raise RuntimeError('무제한 프로파일 전환 미확인 — 스트리밍 시작 안 함')
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
-    try:
+
+        send_fail = 0
         for tk in ticks:
             t0 = time.monotonic()
             try:
                 _post('pose', joints={j: round(tk[j], 2) for j in J5}, timeout=2.0)
-            except Exception:
-                pass                               # 단발 유실은 다음 틱이 덮는다
+                send_fail = 0
+            except Exception as e:
+                send_fail += 1                    # 단발 유실은 다음 틱이 덮는다
+                if send_fail >= 3:
+                    raise RuntimeError(
+                        f'pose 연속 전송 실패 3회: {type(e).__name__}') from e
             if t0 - gate_t >= 0.5:
                 gate_t = t0
-                s = _state()
+                s = required_state('스트리밍')
                 tail = (s.get('log') or [''])[-1]
-                if '⛔' in tail and '거부' not in tail:
+                if '⛔' in tail:
                     raise RuntimeError(f'서버 게이트: {tail}')
                 if not s.get('torque'):
                     raise RuntimeError('이동 중 토크 낙하')
@@ -173,28 +189,24 @@ def stream(ticks, hz=15.0, z_floor=None):
                         raise RuntimeError(
                             f'실측 z {fk_z(pos):+.3f} < 하한 {z_floor:+.3f}')
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
-    except RuntimeError:
-        try:
-            _post('teleop_profile', on=False, timeout=10.0)
-        except Exception:
-            pass
-        raise
-    try:
-        # ★ 마무리: 목표를 계속 재전송하며 수렴을 기다린다 (2026-08-26).
-        # 종전에는 4.5초만 기다리고 **미도달이어도 성공으로 반환**해, 어깨가
-        # 22° 못 미친 자세를 "작업 자세 도달"로 보고했다. 중력 부하 관절은
-        # 명령 궤적이 끝난 뒤에도 몇 초 더 따라온다.
+
+        # 마무리에서는 명령을 다시 보내지 않는다. 마지막 틱의 목표를 향해 서보가
+        # 계속 움직이는 동안 도달 여부만 최대 20초 확인한다.
         tgt = ticks[-1]
         last = None
         for k in range(40):                        # 최대 20초
-            if k % 3 == 0:                         # 목표 재전송 (유실 대비)
-                try:
-                    _post('pose', joints={j: round(tgt[j], 2) for j in J5},
-                          timeout=2.0)
-                except Exception:
-                    pass
-            pos = _state().get('pos') or {}
+            s = required_state('최종 수렴 확인')
+            tail = (s.get('log') or [''])[-1]
+            if '⛔' in tail:
+                raise RuntimeError(f'최종 수렴 중 서버 게이트: {tail}')
+            if not s.get('torque'):
+                raise RuntimeError('최종 수렴 중 토크 낙하')
+            pos = s.get('pos') or {}
             if all(j in pos for j in J5):
+                if z_floor is not None and fk_z(pos) < z_floor:
+                    raise RuntimeError(
+                        f'최종 수렴 중 실측 z {fk_z(pos):+.3f} < '
+                        f'하한 {z_floor:+.3f}')
                 gap = max(abs(pos[j] - tgt[j]) for j in J5)
                 if gap < 2.5:
                     return pos
@@ -203,8 +215,37 @@ def stream(ticks, hz=15.0, z_floor=None):
                 last = gap
             time.sleep(0.5)
         raise RuntimeError(f'수렴 시간 초과 — 목표에서 {gap:.1f}° 남음')
-    finally:
-        try:
-            _post('teleop_profile', on=False, timeout=10.0)
-        except Exception:
-            pass
+
+    error = None
+    result = None
+    try:
+        result = run_stream()
+    except BaseException as e:
+        error = e
+
+    cleanup_error = None
+    try:
+        # 성공·실패·Ctrl-C 모두 여기서 안전 프로파일 복원을 확인한다.
+        _post('teleop_profile', on=False, timeout=10.0)
+        for _ in range(10):
+            if not _state().get('teleop'):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError('안전 프로파일 복원 미확인')
+    except Exception as e:
+        cleanup_error = RuntimeError(
+            f'안전 프로파일 복원 실패: {type(e).__name__}')
+
+    if cleanup_error is not None:
+        if error is not None and not isinstance(error, (KeyboardInterrupt,
+                                                         SystemExit)):
+            raise RuntimeError(f'{error} · {cleanup_error}') from error
+        if error is None:
+            raise cleanup_error
+    if error is not None:
+        if isinstance(error, (RuntimeError, KeyboardInterrupt, SystemExit)):
+            raise error
+        raise RuntimeError(
+            f'스트리밍 통신 실패: {type(error).__name__}') from error
+    return result

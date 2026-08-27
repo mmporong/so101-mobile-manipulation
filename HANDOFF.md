@@ -406,7 +406,7 @@ POSES 는 돌출 4cm 실측 기준 아래층 -0.01(밑동-책상 28mm)·x 0.15~0
 | `~/so101-mobile-manipulation/astra.py` | Astra ctypes 바인딩 |
 | `~/so101-mobile-manipulation/handeye.py` | 정합 스크립트 (미검증) — 프리플라이트가 IK·범위·**바닥 여유**를 정적 검사 |
 | `~/so101-mobile-manipulation/floor_from_depth.py` | **비접촉** 바닥 측정 — 뎁스 `/points` 평면 피팅, 정합 후 로봇 z 환산 |
-| `~/so101-mobile-manipulation/unfold_safe.py` | 접힌 팔 펴기 — FK 자코비안 소걸음, 예측·실측 z 대조 |
+| `~/so101-mobile-manipulation/unfold_safe.py` | 접힌 팔 펴기 — FK 안전 웨이포인트를 15Hz 연속 궤적으로 실행 |
 | `~/so101-mobile-manipulation/collect_peaks.py` | 정상 이동 전류 피크 수집 (CURRENT_STOP 보정용) |
 | `~/so101-mobile-manipulation/servo_check.py` | 서보 진단 (읽기 전용) |
 | `~/so101-mobile-manipulation/servo_id.py` | 교체 서보 ID 부여 + 보호 설정 |
@@ -657,17 +657,19 @@ Protection_Time 0.5초**: 중력을 이기는 정상 저속 이동이 그대로 
 있는 자리를 미리 거부했다(검출된 큐브가 x=8.9cm 라 거부됐다). 판정은 IK 가 하고,
 못 닿을 때는 **가장 가까운 실제 가능 지점**을 좌표로 안내한다.
 
-### unfold 는 위험 구간만 쪼갠다
+### unfold는 계산만 나누고 실행은 한 번에 한다
 
-2단계가 관절마다 8° 소걸음 + 걸음당 1초 폴링이라 펴는 데만 분 단위였다. 경로 전체를
-FK 로 훑어(`path_min_z`) 최저 죠 높이가 안전하면 **목표까지 한 번에** 간다.
+8° 간격은 접힌 자세에서 죠를 안전하게 띄울 경로를 찾는 계산 단위다. 이 값을 `goto`로
+하나씩 보내면 엘보가 걸음마다 멈추며 떨린다. 현재 구현은 계산된 웨이포인트 전체를
+`smooth_move`가 15Hz 궤적으로 보간해 한 번에 전송한다. 구간 경계에서는 멈추지 않는다.
 
-    elbow_flex     96.5° · 경로 최저 책상 위 26mm  → 소걸음 유지
-    shoulder_lift 106.7° · 책상 위 119mm           → 한 번에 (13걸음 → 1회)
-    wrist_flex     20.3° · 책상 위 105mm           → 한 번에
+    저공 부양 구간             7°/s
+    shoulder_lift 한 구간      최대 6°/s
+    나머지 작업 자세 구간     13°/s
 
-안전은 쪼개기가 아니라 **사전 검사**가 만든다. `test_unfold_path.py` 가 실물 없이
-이 판정을 검증한다(해상도를 8배 높여도 판정이 안 뒤집히는지 포함).
+팬 잠금 중에는 작업 자세의 `shoulder_pan=0°`를 쓰지 않고 잠금 중심을 목표로 삼는다.
+`test_unfold_path.py`는 경로 최저 높이, 연속 틱 간 최대 변화, 팬 목표, 숄더 속도를
+실물 없이 검증한다.
 
 ### 그 밖에 고친 것
 

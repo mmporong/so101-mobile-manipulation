@@ -9,7 +9,6 @@
 import json
 import pathlib
 import sys
-import time
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -24,6 +23,10 @@ STEP = 8.0            # 한 걸음 [°]
 Z_CLEAR = 0.02        # 이 z(구 책상면 +12cm)에 오르면 '떴다'로 본다
 WORK = {'shoulder_pan': 0.0, 'shoulder_lift': -5.0, 'elbow_flex': 0.0,
         'wrist_flex': 88.0, 'wrist_roll': 0.0}          # 작업 자세 (POSES 상층 근방)
+CLEAR_SPEED_DPS = 7.0
+SHOULDER_LIFT_SPEED_DPS = 6.0
+NORMAL_SPEED_DPS = 13.0
+CAUTIOUS_SPEED_DPS = 9.0
 
 CAL = json.loads(pathlib.Path('~/.cache/huggingface/lerobot/calibration/robots/'
                               'so_follower/follower.json').expanduser().read_text())
@@ -44,8 +47,16 @@ def state():
 
 def bail(msg):
     # 토크는 유지한다 (2026-08-25 전수 정비) — 서 있는 팔에서 토크 OFF 는 낙하다.
-    post('stop')
-    print(f'\n중단: {msg} — 정지(토크 유지). 팔은 자세를 지킵니다')
+    stopped = True
+    try:
+        post('stop')
+    except Exception as e:
+        stopped = False
+        print(f'정지 요청 실패: {type(e).__name__} — 패널 연결을 확인하세요')
+    if stopped:
+        print(f'\n중단: {msg} — 정지(토크 유지). 팔은 자세를 지킵니다')
+    else:
+        print(f'\n중단: {msg} — 정지 적용 여부를 확인할 수 없습니다')
     sys.exit(1)
 
 
@@ -76,50 +87,22 @@ def path_min_z(pos, joint, target, n=24):
     return lo
 
 
-def move_step(joint, tgt, expect_z, timeout=None):
-    """goto — 1초 폴링으로 추종·z 를 감시한다. timeout 은 이동량에 비례."""
-    r = post('goto', joint=joint, value=round(tgt, 2))
-    if not r.get('ok'):
-        bail(f'{joint} goto 요청 실패 {r}')
-    slow, prev = 0, None
-    deadline = time.monotonic() + (timeout if timeout else 12.0)
-    while True:
-        time.sleep(1.0)
-        s = state()
-        tail = s['log'][-1] if s['log'] else ''
-        if '⛔' in tail or '거부' in tail:
-            bail(f'{joint} 거부: {tail}')
-        if not s['torque']:
-            bail(f'이동 중 토크 낙하: {tail}')
-        now = s['pos'][joint]
-        gap = abs(now - tgt)
-        if gap < 2.5:   # P게인 정지 오차 밴드 밖 (2026-08-25)
-            z = fk_z(s['pos'])
-            return s['pos'], z
-        slow = slow + 1 if (prev is not None and abs(now - prev) < 0.3) else 0
-        prev = now
-        if slow >= 2 and gap > 3.0:
-            bail(f'{joint} 추종 실패 — {gap:.1f}° 남기고 정체 (걸림 의심)')
-        if time.monotonic() > deadline:
-            bail(f'{joint} 시간 초과 — {gap:.1f}° 남음')
+def plan_waypoints(st):
+    """현재 자세에서 작업 자세까지 이어지는 웨이포인트와 구간 속도를 만든다.
 
+    STEP은 저공 구간의 안전 경로를 찾는 계산 간격일 뿐 실행 단위가 아니다.
+    반환된 웨이포인트 전체를 smooth_move가 한 번의 15Hz 궤적으로 보간한다.
+    """
+    work = dict(WORK)
+    if st.get('pan_lock') is not None:
+        work['shoulder_pan'] = float(st['pan_lock'])
 
-def main():
-    st = state()
-    if not (st['connected'] and st['calibrated'] and st['torque']):
-        sys.exit('연결·캘리브·토크 ON 상태가 아닙니다')
-    # 속도를 명시적으로 세운다 — 직전에 stop 이 있었으면 상한이 8(0.7°/s)로
-    # 내려가 있고, goto 는 복원을 안 하므로 8° 걸음이 11초를 넘겨 자체
-    # deadline(12초) 오탐으로 bail(토크 OFF) → 팔 낙하가 성립한다(감사 n3).
-    # 소걸음(8°)일 때 쓰던 속도다. 아래 2단계는 100° 를 한 번에 보내므로
-    # 구간 크기에 따라 속도를 따로 낮춘다 — 급가속은 서보에 그대로 부담이다.
-    post('speed', pct=52)
-    pos = {j: st['pos'][j] for j in J}
-    z = fk_z(pos)
-    print(f'시작 z={z:+.4f}m · 자세 {({k: round(v,1) for k,v in pos.items()})}')
+    pos = {j: float(st['pos'][j]) for j in J}
+    z0 = z = fk_z(pos)
+    waypoints, speeds, joints = [], [], []
 
-    # ── 1단계: 죠 띄우기 — 매 걸음 z 를 가장 올리는 관절·방향 선택 ──────────
-    for it in range(30):
+    # 1단계는 기존 8° 탐색으로 안전한 경로만 계산한다. 팔에는 아직 안 보낸다.
+    for _ in range(30):
         if z >= Z_CLEAR:
             break
         best = None
@@ -132,53 +115,80 @@ def main():
                 if best is None or gain > best[3]:
                     best = (j, d, t, gain)
         if best is None or best[3] < 0.002:
-            bail(f'z 를 올릴 걸음이 없습니다 (z={z:+.4f})')
-        j, d, t, gain = best
-        pos2, z2 = move_step(j, t, z + gain)
-        made = z2 - z
-        print(f'  [{it+1:2d}] {j} {d:+.0f}° → z {z:+.4f}→{z2:+.4f} '
-              f'(예측 {gain*1000:+.1f}mm · 실측 {made*1000:+.1f}mm)')
-        if made < gain * 0.4 - 0.001:
-            bail(f'{j} 이동이 예측만큼 z 를 못 올림 — 걸림 의심')
-        pos, z = pos2, z2
-        time.sleep(0.5)
-    print(f'죠 부양 완료: z={z:+.4f}m\n')
+            raise RuntimeError(f'z를 올릴 경로가 없습니다 (z={z:+.4f})')
+        j, _d, t, gain = best
+        pos = {**pos, j: t}
+        z += gain
+        waypoints.append(dict(pos))
+        speeds.append(CLEAR_SPEED_DPS)
+        joints.append(j)
+    if z < Z_CLEAR:
+        raise RuntimeError(f'죠 부양 경로가 z={z:+.4f}에서 끝났습니다')
 
-    # ── 2단계: 작업 자세로 — 관절별 소걸음, z 가 -0.02 밑으로 떨어지면 중단 ──
-    order = ['elbow_flex', 'shoulder_lift', 'wrist_flex', 'shoulder_pan', 'wrist_roll']
+    # 작업 자세도 관절 순서는 유지하지만, 실행할 때는 구간 경계에서 멈추지 않는다.
+    order = ['elbow_flex', 'shoulder_lift', 'wrist_flex', 'shoulder_pan',
+             'wrist_roll']
     for j in order:
-        if abs(pos[j] - WORK[j]) <= 1.5:
+        if abs(pos[j] - work[j]) <= 1.5:
             continue
-        # 경로 전체가 안전하면 **목표까지 한 번에** 간다. 서보가 자체 속도
-        # 프로파일로 부드럽게 움직이므로, 쪼개는 것은 감시 주기를 위한 것일 뿐
-        # 안전 자체를 만들지 않는다 — 안전은 이 사전 검사가 만든다.
-        zmin = path_min_z(pos, j, WORK[j])
+        zmin = path_min_z(pos, j, work[j])
         if zmin >= -0.02:
-            span = abs(WORK[j] - pos[j])
-            # 멀수록 느리게 — 같은 속도로 긴 구간을 보내면 서보가 급가속한다.
-            # 100° 급은 35%, 30° 안팎은 55%, 짧으면 70% (실측 감각 기준).
-            # 2026-08-21 사용자 지시로 25% 더 낮췄다 — 35% 로도 급했다.
-            # 급가속은 서보 수명을 그대로 깎는다.
-            pct = 26 if span > 70 else (41 if span > 25 else 52)
-            post('speed', pct=pct)
-            time.sleep(0.2)
-            pos, z = move_step(j, WORK[j], zmin,
-                               timeout=max(15.0, 3.0 + span / 4.0))
-            print(f'  {j:14s} → {pos[j]:+7.1f}°  (z={z:+.4f}) '
-                  f'· {span:.0f}° 한 번에 · 속도 {pct}% (경로 최저 z {zmin:+.4f})')
+            pos = {**pos, j: work[j]}
+            waypoints.append(dict(pos))
+            speeds.append(SHOULDER_LIFT_SPEED_DPS if j == 'shoulder_lift'
+                          else NORMAL_SPEED_DPS)
+            joints.append(j)
         else:
-            # 경로 중간이 위험하다 — 그때만 쪼개서 걸음마다 검사한다
-            print(f'  {j:14s} 경로 최저 z {zmin:+.4f} — 소걸음으로 전환')
-            while abs(pos[j] - WORK[j]) > 1.5:
-                d = max(-STEP, min(STEP, WORK[j] - pos[j]))
+            while abs(pos[j] - work[j]) > 1.5:
+                d = max(-STEP, min(STEP, work[j] - pos[j]))
                 t = pos[j] + d
                 zp = predict_z(pos, j, d)
                 if zp < -0.02:
-                    bail(f'{j} 다음 걸음이 z={zp:+.4f} 로 내려감 — 순서 재검토 필요')
-                pos, z = move_step(j, t, zp)
-                print(f'  {j:14s} → {pos[j]:+7.1f}°  (z={z:+.4f})')
-                time.sleep(0.3)
-        time.sleep(0.3)
+                    raise RuntimeError(
+                        f'{j} 다음 경로가 z={zp:+.4f}로 내려갑니다')
+                pos = {**pos, j: t}
+                waypoints.append(dict(pos))
+                speeds.append(CAUTIOUS_SPEED_DPS)
+                joints.append(j)
+        z = fk_z(pos)
+
+    return z0, work, waypoints, speeds, joints
+
+
+def main():
+    st = state()
+    if not (st['connected'] and st['calibrated'] and st['torque']):
+        sys.exit('연결·캘리브·토크 ON 상태가 아닙니다')
+    try:
+        z0, work, waypoints, speeds, joints = plan_waypoints(st)
+    except RuntimeError as e:
+        bail(str(e))
+    print(f'시작 z={z0:+.4f}m · 자세 '
+          f'{({k: round(st["pos"][k], 1) for k in J})}')
+    if st.get('pan_lock') is not None:
+        print(f'팬 목표는 잠금 중심 {work["shoulder_pan"]:+.1f}°를 사용합니다')
+
+    if not waypoints:
+        print('이미 작업 자세라 이동하지 않습니다')
+        return
+
+    import smooth_move as sm
+    start = {j: st['pos'][j] for j in J}
+    ticks = sm.plan(start, waypoints, speeds=speeds)
+    zmin_plan = sm.sweep_z(ticks)
+    shoulder_segments = sum(j == 'shoulder_lift' for j in joints)
+    print(f'연속 계획: 웨이포인트 {len(waypoints)}개를 {len(ticks)}틱으로 보간 · '
+          f'경로 최저 z {zmin_plan:+.4f}')
+    print(f'shoulder_lift {shoulder_segments}구간 · '
+          f'{SHOULDER_LIFT_SPEED_DPS:.1f}°/s')
+    if zmin_plan < min(z0, -0.02) - 0.004:
+        bail(f'계획 경로 z 위반 ({zmin_plan:+.4f}) — 실행하지 않습니다')
+    try:
+        sm.stream(ticks, z_floor=min(z0, zmin_plan) - 0.012)
+    except KeyboardInterrupt:
+        bail('사용자 중단')
+    except RuntimeError as e:
+        bail(str(e))
 
     s = state()
     print(f'\n작업 자세 도달. z={fk_z(s["pos"]):+.4f}m · '

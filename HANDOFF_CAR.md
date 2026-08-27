@@ -117,3 +117,5 @@
 - 사이클마다 **CSV 기록** `~/so101_datasets/pick_log.csv` (`analyze_log.py` 로 분석)
 - 새 도구: `record_range.py`(--seconds/--joint/--merge), `analyze_log.py`,
   `car_align.py`, `aim.py`(높이 경고 포함)
+- `unfold_safe.py`를 연속 이동판으로 복원했다. 8° 안전 웨이포인트는 계산에만 쓰고,
+  실제 팔에는 15Hz 궤적을 한 번 보낸다. `shoulder_lift`는 최대 6°/s 한 구간으로 이동한다.
