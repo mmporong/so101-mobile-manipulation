@@ -2,7 +2,7 @@
 """SO-101 실팔 MuJoCo 미러 (rlwalk 파이썬 — mujoco 3.11).
 
 패널 서버(8765)의 /state 를 10Hz 로 읽어(읽기 전용 — 팔 명령은 일절 없음)
-MJCF qpos 에 반영하고, 뎁스캠 /blob 이 보는 빨간 물체를 체스말 프록시로
+MJCF qpos 에 반영한다. 물체는 작업영역 기본값 또는 --piece-at 교시 좌표에
 배치한다. 좌표 변환은 frame_fit.py 가 적합한 sim_frame.json (RMS 0.00mm,
 p_sim = R @ p_K + t · qpos = URDF q 직결).
 
@@ -14,18 +14,14 @@ p_sim = R @ p_K + t · qpos = URDF q 직결).
 """
 import argparse
 import json
-import math
 import pathlib
 import sys
 import time
 import urllib.request
 
-import numpy as np
-
 D = pathlib.Path(__file__).parent
 sys.path.insert(0, str(D))
 sys.path.insert(0, str(D.parent))
-import arm_lib
 import sim_core                            # 씬 규약(롤 오프셋·파지 판정·좌표)의 단일 출처
 
 BASE = 'http://127.0.0.1:8765'
@@ -40,17 +36,6 @@ def get(path, timeout=2.0):
 
 
 load_frame = sim_core.load_frame
-
-
-def panel_to_sim(p, R, t):
-    """패널 좌표(PAN0 기준) → 시뮬 월드."""
-    return R @ (np.array(p, float) + np.array(arm_lib.PAN0)) + t
-
-
-def read_blob_pose(R_he, t_he, floor, h_center, piece):
-    """뎁스캠이 본 물체의 (x, y) 와 방향 — 계산은 sim_core 가 한 곳에서 한다."""
-    b = get('/blob').get('blob') or {}
-    return sim_core.blob_pose(b, R_he, t_he, floor, h_center, piece)
 
 
 def main():
@@ -74,9 +59,6 @@ def main():
     # 갈라지면 화면 둘이 서로 다른 로봇을 그리게 된다 (2026-08-21 분리).
     sim = sim_core.SimMirror(piece=a.piece)
     model, data = sim.model, sim.data
-    R, t = sim.R, sim.t
-    floor = sim.floor
-    PIECE_H = sim.piece_h
 
     def set_piece(xy, yaw=None):
         # 방향을 안 그리면 미러가 거짓말을 한다 — 대각 큐브를 축 정렬로 그리면
@@ -86,12 +68,6 @@ def main():
     def set_pose_deg(deg):
         # --piece-at 로 물체를 고정 배치했으면 죠 부착을 끈다(수동 배치 우선)
         sim.set_pose_deg(deg, attach=not a.piece_at)
-
-    he_R = he_t = None
-    hep = D.parent / 'handeye.json'
-    if hep.exists():
-        he = json.loads(hep.read_text())
-        he_R, he_t = np.array(he['R']), np.array(he['t'])
 
     if a.piece_at:
         set_piece([float(v) for v in a.piece_at.split(',')])
@@ -114,7 +90,7 @@ def main():
             r.update_scene(data, camera=a.cam)
         else:
             cam = mujoco.MjvCamera()
-            cam.lookat[:] = panel_to_sim((0.15, 0.0, 0.0), R, t)
+            cam.lookat[:] = sim.panel_to_sim((0.15, 0.0, 0.0))
             cam.distance, cam.azimuth, cam.elevation = 0.9, 150, -25
             r.update_scene(data, camera=cam)
         px = r.render()
@@ -131,7 +107,7 @@ def main():
         cam = None
         if not a.cam:
             cam = mujoco.MjvCamera()
-            cam.lookat[:] = panel_to_sim((0.15, 0.0, 0.0), R, t)
+            cam.lookat[:] = sim.panel_to_sim((0.15, 0.0, 0.0))
             cam.distance, cam.azimuth, cam.elevation = 0.9, 150, -25
         outd = pathlib.Path(a.record)
         outd.mkdir(parents=True, exist_ok=True)
@@ -143,13 +119,6 @@ def main():
             try:
                 st = get('/state', timeout=1.0)
                 set_pose_deg(st['pos'])
-                if (he_R is not None and not a.piece_at
-                        and not sim.holding
-                        and n % int(a.fps) == 0):   # 안 물고 있을 때만 갱신
-                    xy, yaw = read_blob_pose(he_R, he_t, floor, PIECE_H,
-                                             a.piece)
-                    if xy:
-                        set_piece(xy, yaw)
             except Exception:
                 pass
             if a.cam:
@@ -165,7 +134,6 @@ def main():
     import mujoco.viewer
     print('미러 시작 — 창을 닫으면 종료 (팔 명령 없음, 읽기 전용)')
     with mujoco.viewer.launch_passive(model, data) as v:
-        n = 0
         while v.is_running():
             t0 = time.monotonic()
             if not a.deg:
@@ -174,16 +142,6 @@ def main():
                     set_pose_deg(st['pos'])
                 except Exception:
                     pass                          # 서버 순단 — 마지막 자세 유지
-                n += 1
-                if (he_R is not None and not a.piece_at
-                        and n % int(a.hz) == 0):  # 물체는 1Hz 갱신
-                    try:
-                        xy, yaw = read_blob_pose(he_R, he_t, floor, PIECE_H,
-                                                 a.piece)
-                        if xy:
-                            set_piece(xy, yaw)
-                    except Exception:
-                        pass
             v.sync()
             time.sleep(max(0.0, 1.0 / a.hz - (time.monotonic() - t0)))
 

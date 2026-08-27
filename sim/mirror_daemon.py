@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """SO-101 미러 렌더 데몬 (2026-08-21) — 헤드리스 MuJoCo → JPEG.
 
-깊이 데몬(depth_daemon.py)과 같은 이유로 **별도 프로세스**다: mujoco 는
-rlwalk 환경에만 있고 패널 서버는 lerobot 환경에서 돈다. 패널은 이 데몬을
-자식으로 띄워 /mirror 로 중계한다.
+mujoco 는 rlwalk 환경에만 있고 패널 서버는 lerobot 환경에서 돌기 때문에
+별도 프로세스로 분리한다. 패널은 이 데몬을 자식으로 띄워 /mirror 로 중계한다.
 
 이 데몬은 팔에 명령을 내리지 않는다 — /state 를 읽어 그릴 뿐이다.
 
@@ -14,6 +13,7 @@ HTTP:
   POST /view              {azimuth, elevation, distance} 시점
   POST /preview           {deg:{관절:도}, hold:초} 목표 자세 미리보기(라이브 일시정지)
   POST /replay            {frames:[{관절:도}...], fps} 궤적 재생 후 라이브 복귀
+  POST /piece             {x, y, yaw?} 시뮬 물체 위치 지정(팔은 움직이지 않음)
   POST /live              라이브 복귀 (프리뷰·재생 취소)
 
 유휴 절전: 프레임을 아무도 안 가져가면 렌더율을 1Hz 로 낮춘다. 안 그러면
@@ -28,8 +28,6 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-import numpy as np
 
 D = pathlib.Path(__file__).parent
 sys.path.insert(0, str(D))
@@ -58,15 +56,10 @@ class Renderer(threading.Thread):
         self.last_pull = 0.0          # 마지막 프레임 반출 시각
         self.mode = 'live'            # live | preview | replay
         self.pose = {}
-        self.piece_xy = None
+        self.piece_xy = tuple(sim_core.DEFAULT_PIECE_XY)
         self.piece_yaw = None
         self.closing = False
         self._script = None           # (frames, fps, t_end) — preview/replay
-        self._he = None
-        hep = D.parent / 'handeye.json'
-        if hep.exists():
-            he = json.loads(hep.read_text())
-            self._he = (np.array(he['R']), np.array(he['t']))
 
     # ---- 외부 조작 -----------------------------------------------------
     def set_script(self, frames, fps, mode, hold=0.0):
@@ -80,30 +73,21 @@ class Renderer(threading.Thread):
             self._script = None
             self.mode = 'live'
 
+    def place_piece(self, x, y, yaw=None):
+        """시뮬 물체만 옮긴다. 실팔 명령 경로와 분리된 표시 전용 조작이다."""
+        xy = (float(x), float(y))
+        with self.lock:
+            self.sim.set_piece(xy, yaw)
+            self.piece_xy = xy
+            self.piece_yaw = yaw
+
     def take_jpeg(self):
         with self.lock:
             self.last_pull = time.monotonic()
             return self.jpeg
 
     # ---- 루프 ----------------------------------------------------------
-    def _blob_pose(self):
-        """뎁스캠이 본 물체의 (x, y) 와 방향 yaw[°] — 파지 파이프라인과 같은 식.
-
-        위치는 방위각 ∩ 평면(깊이 무관), 방향은 깊이 3D 점의 상대 상단 군집에
-        회전사각형을 적합한 값이다. **pick_demo 의 함수를 그대로 불러 쓴다** —
-        미러가 자체 계산을 갖게 두면 화면과 팔이 서로 다른 물체를 믿게 된다.
-
-        돌려주는 값: ((x, y), yaw) · 검출 실패면 (None, None)
-        """
-        if self._he is None:
-            return None, None
-        R, t = self._he
-        b = (_get(f'{PANEL}/blob', timeout=1.0).get('blob') or {})
-        return sim_core.blob_pose(b, R, t, self.sim.floor, self.sim.piece_h,
-                                  self.sim.piece)
-
     def run(self):
-        n = 0
         while not self.closing:
             t0 = time.monotonic()
             idle = (t0 - self.last_pull) > IDLE_S
@@ -119,18 +103,6 @@ class Renderer(threading.Thread):
                     self.pose = st.get('pos') or {}
                     if self.pose:
                         self.sim.set_pose_deg(self.pose)
-                    # 물체는 1Hz 로만 갱신하고, **물고 있지 않을 때만** 갱신한다
-                    # (문 상태에서 갱신하면 손에 든 물체가 책상으로 되돌아간다).
-                    # 죠 열림 조건은 뺐다 — 사람이 손으로 물려준 경우 죠는 이미
-                    # 닫혀 있고, 그때 blob 은 죠에 물린 물체를 가리킨다. 안 읽으면
-                    # 미러가 그 사실을 영영 모른다 (2026-08-21 실측).
-                    if (not idle and n % max(1, int(hz)) == 0
-                            and not self.sim.holding):
-                        xy, yaw = self._blob_pose()
-                        if xy:
-                            self.piece_xy = xy
-                            self.piece_yaw = yaw
-                            self.sim.set_piece(xy, yaw)
             except Exception:
                 pass                        # 패널 순단 — 마지막 자세를 계속 그린다
             # 절전은 '정지'가 아니라 '저속'(1Hz)이다 — 아예 멈추면 다시 열었을
@@ -147,7 +119,6 @@ class Renderer(threading.Thread):
             except Exception:
                 pass
             self.beat = time.monotonic()
-            n += 1
             time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - t0)))
 
     def _step_script(self, script):
@@ -242,6 +213,14 @@ def make_handler(rd):
                 if self.path == '/live':
                     rd.go_live()
                     return self._json({'ok': True})
+                if self.path == '/piece':
+                    x, y = float(body['x']), float(body['y'])
+                    if not (0.05 <= x <= 0.35 and -0.25 <= y <= 0.25):
+                        return self._json({'ok': False,
+                                           'msg': '물체 좌표가 표시 작업영역 밖입니다'}, 400)
+                    yaw = float(body['yaw']) if body.get('yaw') is not None else None
+                    rd.place_piece(x, y, yaw)
+                    return self._json({'ok': True, 'piece_xy': [x, y], 'yaw': yaw})
             except Exception as e:
                 return self._json({'ok': False, 'msg': str(e)}, 500)
             self._json({'error': 'not found'}, 404)

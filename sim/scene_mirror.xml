@@ -17,6 +17,8 @@
     <material name="ground_mat" texture="ground_tx" texuniform="true"
               texrepeat="5 5" reflectance="0.1"/>
     <material name="desk_mat" rgba="0.72 0.58 0.42 1"/>
+    <material name="platform_deck_mat" rgba="0.08 0.09 0.10 1"/>
+    <material name="platform_post_mat" rgba="0.78 0.80 0.82 1"/>
   </asset>
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
@@ -26,10 +28,28 @@
       <geom name="desk_top" type="box" size="0.35 0.45 0.03" material="desk_mat"
             contype="0" conaffinity="0"/>
     </body>
+    <!-- JD-AMR 상판 받침대 근사: 300×240×160mm, 검은 3단 데크와 4개 포스트.
+         몸체 원점은 런타임에 테이블 상면으로 옮기고, 최상단 z=160mm가 되게 한다. -->
+    <body name="mobile_platform" mocap="true" pos="0.14 0 0.0244">
+      <geom name="platform_bottom" type="box" size="0.15 0.12 0.004"
+            pos="0 0 0.004" material="platform_deck_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_middle" type="box" size="0.15 0.12 0.004"
+            pos="0 0 0.080" material="platform_deck_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_top" type="box" size="0.15 0.12 0.004"
+            pos="0 0 0.156" material="platform_deck_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_post_fl" type="cylinder" size="0.006 0.074"
+            pos="0.13 0.10 0.082" material="platform_post_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_post_fr" type="cylinder" size="0.006 0.074"
+            pos="0.13 -0.10 0.082" material="platform_post_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_post_rl" type="cylinder" size="0.006 0.074"
+            pos="-0.13 0.10 0.082" material="platform_post_mat" contype="0" conaffinity="0"/>
+      <geom name="platform_post_rr" type="cylinder" size="0.006 0.074"
+            pos="-0.13 -0.10 0.082" material="platform_post_mat" contype="0" conaffinity="0"/>
+    </body>
     <!-- 물체 프록시 둘 다 유지 (2026-08-20 저녁): 기본은 4×4cm 큐브,
          체스말(원기둥 Ø22×70mm) 모드도 보존 — sim_view --piece 가 활성
          프록시를 고르고 비활성은 지면 아래로 치운다 -->
-    <body name="piece" mocap="true" pos="0.35 0.15 0.25">
+    <body name="piece" mocap="true" pos="0.3288 0 0.0444">
       <geom name="piece_body" type="box" size="0.02 0.02 0.02"
             rgba="0.85 0.10 0.10 1" contype="0" conaffinity="0"/>
     </body>
@@ -39,7 +59,7 @@
     </body>
     <!-- 투하 상자: 검은 개방형 8×8cm × 높이 6.5cm, 방출 지점 패널
          (0.042,-0.142) — 2026-08-20 저녁 사용자 제원. 원점은 바닥면 중심 -->
-    <body name="dropbox" mocap="true" pos="0.1808 -0.142 0.1844">
+    <body name="dropbox" mocap="true" pos="0.1808 -0.142 0.0244">
       <geom name="box_bottom" type="box" size="0.04 0.04 0.002" pos="0 0 0.002"
             rgba="0.15 0.15 0.15 1" contype="0" conaffinity="0"/>
       <geom name="box_wall_y1" type="box" size="0.04 0.004 0.0325"

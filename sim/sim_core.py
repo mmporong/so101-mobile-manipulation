@@ -9,6 +9,7 @@ sim_view.py(창 뷰어)와 mirror_daemon.py(헤드리스 렌더 데몬)가 같�
   · qpos = URDF q 직결, p_sim = R @ p_K + t (sim_frame.json, RMS 0.00mm)
   · wrist_roll 은 실물이 URDF 대비 -90° 돌아 조립돼 있다 → 표시 보정
   · '물었다' 판정은 각도가 아니라 **열림→닫힘 전이 + 7cm 근접**
+  · 테이블·차량 상판·물체·반납 상자는 floor_z_m 하나를 기준으로 배치
 """
 import json
 import math
@@ -26,63 +27,9 @@ LYING_QUAT = (0.7071068, 0.0, 0.7071068, 0.0)    # 원기둥 z축 → x축 (누�
 ROLL_OFFSET_RAD = math.radians(-90)
 GRIP_HOLD_DEG = 25
 PIECE_H = {'cube': 0.02, 'lying': 0.011, 'standing': 0.035}
-
-
-def teach_offset(piece):
-    """물체별 교시 오프셋 [m] — 없으면 (0, 0).
-
-    파지 목표 = 방위각 추정 − 이 오프셋이다(블롭 중심 편향 + 정합 잔차를 흡수).
-    즉 물체의 **실제** 자리도 추정 − 오프셋이라, 미러도 같은 보정을 해야
-    화면의 큐브가 실물과 같은 자리에 놓인다. 교시 전에는 0 이라 종전과 같다."""
-    key = 'cube_xy_offset_m' if piece == 'cube' else 'grasp_xy_offset_m'
-    try:
-        return arm_lib.load_gain(key)[key]
-    except SystemExit:
-        return (0.0, 0.0)
-
-
-def blob_pose(b, R, t, floor, h_center, piece, offset=None):
-    """뎁스캠 blob dict → ((x, y), yaw[°]) · 검출 실패면 (None, None).
-
-    offset 을 주면 그만큼 뺀 자리를 돌려준다 (기본: 물체별 교시 오프셋).
-
-    파지 파이프라인(pick_demo)과 **같은 식**을 쓴다 — 위치는 방위각 ∩ 평면
-    (깊이 무관), 방향은 큐브면 깊이 3D 상단 군집의 회전사각형, 누운 체스말이면
-    이미지 주축을 평면에 투영한 각이다. 미러가 자체 계산을 갖게 두면 화면과
-    팔이 서로 다른 물체를 믿게 되므로, 여기서도 pick_demo 의 함수를 불러 쓴다.
-
-    HTTP 를 타지 않고 blob dict 만 받는다 — 뷰어·데몬·테스트가 같이 쓴다.
-    """
-    if not b or b.get('u') is None or not b.get('fx'):
-        return None, None
-    d = R @ np.array([(b['u'] - b['w'] / 2) / b['fx'],
-                      (b['v'] - b['h'] / 2) / b['fy'], 1.0])
-    if abs(d[2]) < 1e-6:
-        return None, None
-    s = (floor + h_center - t[2]) / d[2]
-    if not (0.2 < s < 1.5):
-        return None, None
-    p = t + s * d
-    off = teach_offset(piece) if offset is None else offset
-    xy = (float(p[0]) - off[0], float(p[1]) - off[1])
-
-    yaw = None
-    try:
-        import pick_demo as pd
-        if piece == 'cube' and b.get('pix'):
-            face = pd.cube_face_yaw(R, t, floor,
-                                    [(b['pix'], b['fx'], b['fy'],
-                                      b['w'], b['h'])])
-            if face is not None:
-                yaw = face[0]
-        elif piece == 'lying' and b.get('axis_deg') is not None:
-            brg = np.array([(b['u'] - b['w'] / 2) / b['fx'],
-                            (b['v'] - b['h'] / 2) / b['fy']])
-            yaw = pd.piece_yaw(brg, b['axis_deg'], (b['fx'], b['fy']),
-                               R, t, floor, h_center)
-    except Exception:
-        yaw = None            # 방향 실패는 위치까지 버릴 이유가 아니다
-    return xy, yaw
+PLATFORM_HEIGHT_M = 0.160
+DEFAULT_PIECE_XY = (0.190, 0.000)
+DROPBOX_XY = (0.042, -0.142)
 
 
 def quat_mul(a, b):
@@ -122,11 +69,21 @@ class SimMirror:
         self.jadr = {j: self.model.jnt_qposadr[mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_JOINT, j)] for j in JN + ['gripper']}
         self.mocap_id = {n: self.model.body(n).mocapid[0]
-                         for n in ('desk', 'piece', 'piece_cyl', 'dropbox')}
+                         for n in ('desk', 'mobile_platform', 'piece',
+                                   'piece_cyl', 'dropbox')}
         # cube → 'piece'(큐브 박스), lying/standing → 'piece_cyl'(체스말 원기둥)
         self.PIECE = 'piece' if piece == 'cube' else 'piece_cyl'
         desk_c = self.panel_to_sim((0.15, 0.0, self.floor))
         self.data.mocap_pos[self.mocap_id['desk']] = desk_c - np.array([0, 0, 0.03])
+        # 차량 상판은 테이블에서 160mm, pan 축은 상판에서 78mm 위다. 플랫폼
+        # 몸체 원점을 테이블 상면에 두면 XML의 최상단 데크가 정확히 floor+160mm다.
+        self.data.mocap_pos[self.mocap_id['mobile_platform']] = self.panel_to_sim(
+            (0.0, 0.0, self.floor))
+        self.data.mocap_pos[self.mocap_id['dropbox']] = self.panel_to_sim(
+            (DROPBOX_XY[0], DROPBOX_XY[1], self.floor))
+        # 물체 위치는 추정값으로 꾸미지 않는다. 실측/교시 좌표가 들어오기 전에는
+        # 작업영역 중앙의 명시적 기본값을 쓴다.
+        self.set_piece(DEFAULT_PIECE_XY)
         self.cam = mujoco.MjvCamera()
         self.cam.lookat[:] = self.panel_to_sim((0.15, 0.0, 0.0))
         self.cam.distance, self.cam.azimuth, self.cam.elevation = 0.9, 150, -25
@@ -189,8 +146,8 @@ class SimMirror:
             d = float(np.linalg.norm(np.array(self.data.mocap_pos[pid]) - gsite))
             # ★ 물리 증거 우선 (2026-08-25 "실물은 잡았는데 미러는 아니라던" 수정):
             # 빈 닫힘은 ~2 까지 내려가고 큐브(30mm)를 물면 8~24 에서 막혀 멈춘다.
-            # 하강 중 팔이 뎁스캠을 가려 심 쪽 큐브 위치가 낡으면 근접 판정이
-            # 실패하므로, 죠 폭이 물림 대역에서 **정착**(전이폭<0.8)하면 파지다.
+            # 심 쪽 큐브 위치가 낡아 근접 판정이 실패할 수 있으므로, 죠 폭이
+            # 물림 대역에서 **정착**(전이폭<0.8)하면 파지다.
             blocked = (6.0 < now_g < GRIP_HOLD_DEG
                        and abs(now_g - prev_g) < 0.8)
             self._holding = blocked or d < 0.12
