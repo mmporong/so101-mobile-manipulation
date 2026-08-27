@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""파지 데모 — 뎁스캠이 본 빨간 물체를 광선∩책상평면으로 위치 추정해 잡는다.
+"""레거시 벤치 전용 파지 데모 — 뎁스캠 정합으로 물체 위치를 추정해 잡는다.
 
 pick_red.py(손목캠 폐루프)와 달리 **hand-eye 정합**을 쓰는 첫 소비자다:
     시선 광선: origin = t,  dir = R·[bx, by, 1]   (handeye.json)
     물체 중심: 광선 ∩ 평면 z = floor + h_center   (물체 깊이 불필요 — 고무도 됨)
 
 사용:
-    python3 pick_demo.py standing    # 서 있는 체스말 (중심 3.5cm, 파지 4.5cm 높이)
-    python3 pick_demo.py lying       # 누운 체스말   (중심 1.1cm, 파지 1.2cm 높이)
-    python3 pick_demo.py standing --dry   # 위치 계산·프리플라이트만, 이동 없음
+    python3 pick_demo.py standing --legacy-bench
 
 안전: 팔 전체 토크 ON 필요. 이동은 서버 ik(스톨·과전류 감시 내장) 경유, 매 지점
 도달·토크 확인. 관측 실패는 이동 실패가 아니다 — stop 없이 중단(감사 M1).
@@ -353,8 +351,13 @@ def move_and_wait(x, y, z, timeout=25.0, roll=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('pose', choices=list(POSE))
+    ap.add_argument('--legacy-bench', action='store_true',
+                    help='Astra/hand-eye 레거시 벤치 경로를 명시적으로 허용')
     ap.add_argument('--dry', action='store_true', help='위치 계산·검증만, 이동 없음')
     a = ap.parse_args()
+    if not a.legacy_bench:
+        sys.exit('pick_demo.py는 레거시 뎁스 벤치 전용입니다 — 차량에서는 '
+                 'pick_wrist.py를 사용하세요. 벤치에서만 --legacy-bench를 지정합니다')
     h_center, h_grip = POSE[a.pose]
 
     he_p = pathlib.Path(__file__).parent / 'handeye.json'
@@ -367,9 +370,9 @@ def main():
     # 파지 오프셋 — 교시 상수를 필수 선언으로 로드: stale/누락이면 여기서 멈춘다
     # (리뷰 M3: 무선언 .get(기본 [0,0]) 은 12mm 보정이 말없이 사라지는 경로였다)
     OFF = arm_lib.load_gain('grasp_xy_offset_m')['grasp_xy_offset_m']
-    # TODO(2026-08-20 사용자 피드백): 이 오프셋으로 파지는 성공했으나 하강 중
-    # 죠가 물체를 살짝 스쳤다 — "아랫턱이 물체보다 조금 더 왼쪽에 온 상태로
-    # 파지돼도 된다". 다음 실물 세션에서 손목캠으로 방향 확인 후 수 mm 보정.
+    # 실물 재확인 메모(2026-08-20): 이 오프셋으로 파지는 성공했지만 하강 중
+    # 죠가 물체를 살짝 스쳤다. 값 변경은 손목캠 방향과 수 mm 오차를 다시
+    # 계측한 뒤에만 허용하며, stale 교시값은 load_gain 경계에서 거부한다.
 
     ensure_cam_home()          # 관측 전에 정합이 유효한 자세인지 보장한다
     brg, axis_img, fxy = read_bearing(with_axis=True)

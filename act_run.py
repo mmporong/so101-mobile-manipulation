@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ACT 정책으로 팔 구동 (2026-08-24) — 수집→학습→실행 파이프라인의 마지막 조각.
+"""손목캠 전용 ACT 정책으로 팔 구동한다.
 
-관측(관절각 + 손목캠 + 뎁스 컬러)을 10Hz 로 정책에 넣고, 출력 목표각을 패널
+관측(관절각 + 손목캠)을 10Hz 로 정책에 넣고, 출력 목표각을 패널
 `pose` op(6관절 일괄 sync_write)으로 보낸다. 정책은 청크(30스텝)를 캐시하므로
 추론은 3초에 한 번, 나머지는 큐에서 꺼낸다 — 실측 0.2ms/스텝.
 
@@ -20,12 +20,9 @@
 전제: 패널(8765, pose op 지원) · 토크 ON · 팔은 작업 자세 · 큐브 배치
 """
 import argparse
-import math
 import pathlib
 import sys
 import time
-
-import numpy as np
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
@@ -61,7 +58,7 @@ def load_policy(ckpt):
     return pol, pre, post, dev
 
 
-def get_obs(need_depth):
+def get_obs(need_depth=False):
     """관측 한 벌 — 학습 데이터와 같은 형식 (없으면 None)."""
     import cv2
     import torch
@@ -72,11 +69,6 @@ def get_obs(need_depth):
     wrist = wc.frame()
     if wrist is None:
         return None, st
-    dep = None
-    if need_depth:
-        dep = _depth_frame()
-        if dep is None:
-            return None, st
 
     def img_t(bgr):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -89,27 +81,7 @@ def get_obs(need_depth):
         'observation.images.wrist': img_t(wrist),
         'task': '',
     }
-    if need_depth:
-        obs['observation.images.depth'] = img_t(dep)
     return obs, st
-
-
-def _depth_frame():
-    import urllib.request
-    import cv2
-    try:
-        r = urllib.request.urlopen('http://127.0.0.1:8765/depth', timeout=5)
-    except Exception:
-        return None
-    buf = b''
-    for _ in range(200):
-        buf += r.read(8192)
-        s = buf.find(b'\xff\xd8')
-        e = buf.find(b'\xff\xd9', s + 2) if s >= 0 else -1
-        if s >= 0 and e > s:
-            return cv2.imdecode(np.frombuffer(buf[s:e + 2], np.uint8),
-                                cv2.IMREAD_COLOR)
-    return None
 
 
 def fk_z_of(deg):
@@ -140,7 +112,10 @@ def main():
     print(f'정책 로드: {a.ckpt}')
     pol, pre, post, dev = load_policy(a.ckpt)
     need_depth = 'observation.images.depth' in (getattr(pol.config, 'input_features', {}) or {})
-    print('입력 카메라:', 'wrist+depth' if need_depth else 'wrist')
+    if need_depth:
+        sys.exit('이 체크포인트는 observation.images.depth를 요구합니다. 차량 프로필은 '
+                 '손목캠 단독이므로 로드 직후 실행을 거부합니다.')
+    print('입력 카메라: wrist')
     # 파지 정밀도 개선 옵션 (2026-08-25 1차 롤아웃 "큐브를 치기만 함" 대응):
     # 기본 ACT 는 3초(30스텝) 개루프라 접근 오차를 청크 끝까지 못 고친다.
     if a.ensemble:

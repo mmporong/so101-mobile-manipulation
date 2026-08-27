@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """노트북에서 손목캠 YOLO를 실행하는 읽기 전용 관찰기.
 
-팔과 차량에는 명령을 보내지 않는다. 패널의 MJPEG `/cam`을 한 번 연결해 계속
-읽고, 실제 차량용 모델을 검증하거나 이후 주행 상태머신에 넣을 JSON 관측을 만든다.
+팔과 차량에는 명령을 보내지 않는다. 패널의 원자적 `/frame.jpg` 캡처를 읽어
+실제 차량용 모델을 검증하거나 이후 주행 상태머신에 넣을 JSON 관측을 만든다.
 """
 import argparse
 import json
@@ -41,23 +41,63 @@ def mjpeg_jpegs(stream, chunk_size=8192, max_buffer=2_000_000):
             del buf[:end]
 
 
-def open_frames(api=DEFAULT_API, timeout=8.0):
-    """MJPEG 연결을 유지하며 BGR 프레임을 반환한다."""
+def fresh_sequence(meta, previous=None, max_age=1.0):
+    """패널 메타데이터가 새 캡처인지 검사해 재전송 JPEG를 걸러낸다."""
+    try:
+        seq, age = int(meta['sequence']), float(meta['age'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (meta.get('stale') or meta.get('available') is False
+            or not time_is_finite(age) or age < 0 or age > max_age):
+        return None
+    return seq if previous is None or seq > previous else None
+
+
+def time_is_finite(value):
+    import math
+    return math.isfinite(value)
+
+
+def read_atomic_frame(api=DEFAULT_API, timeout=8.0, previous=None, max_age=1.0):
+    """동일 캡처의 JPEG와 sequence/age 헤더를 함께 검증한다."""
     import cv2
     import numpy as np
 
-    response = urllib.request.urlopen(f'{api.rstrip("/")}/cam', timeout=timeout)
+    response = urllib.request.urlopen(f'{api.rstrip("/")}/frame.jpg', timeout=timeout)
     try:
-        for jpeg in mjpeg_jpegs(response):
-            image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is not None:
-                yield image
+        jpeg = response.read()
+        meta = {'sequence': response.headers.get('X-Frame-Sequence'),
+                'captured_at': response.headers.get('X-Frame-Captured-At'),
+                'age': response.headers.get('X-Frame-Age')}
     finally:
         response.close()
+    sequence = fresh_sequence(meta, previous, max_age=max_age)
+    if sequence is None:
+        raise RuntimeError('손목캠 프레임이 반복됐거나 freshness 검증에 실패했습니다')
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError('손목캠 JPEG 디코딩 실패')
+    try:
+        captured_at = float(meta['captured_at'])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError('손목캠 captured_at이 없습니다') from exc
+    if not time_is_finite(captured_at):
+        raise RuntimeError('손목캠 captured_at이 유효하지 않습니다')
+    meta.update(sequence=sequence, age=float(meta['age']), captured_at=captured_at)
+    return image, meta
 
 
-def read_one_frame(api=DEFAULT_API, timeout=8.0):
-    frames = open_frames(api, timeout=timeout)
+def open_frames(api=DEFAULT_API, timeout=8.0, include_meta=False):
+    """원자 endpoint에서 sequence가 증가하는 캡처만 반환한다."""
+    last_sequence = None
+    while True:
+        image, meta = read_atomic_frame(api, timeout=timeout, previous=last_sequence)
+        last_sequence = meta['sequence']
+        yield (image, meta) if include_meta else image
+
+
+def read_one_frame(api=DEFAULT_API, timeout=8.0, with_meta=False):
+    frames = open_frames(api, timeout=timeout, include_meta=with_meta)
     try:
         return next(frames)
     finally:

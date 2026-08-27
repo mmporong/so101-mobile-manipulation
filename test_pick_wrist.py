@@ -26,8 +26,6 @@ pick_wrist.py 를 만들면서 리허설 없이 실물로 바로 돌렸다. 그 
   ⑤ 물체가 시야 밖이면 탐색하는가
   ⑥ 리치 밖 목표에서 죽지 않고 높이를 다시 고르는가
 """
-import io
-import json
 import pathlib
 import sys
 import threading
@@ -44,12 +42,31 @@ from test_place_down import FakeArm, make_handler          # noqa: E402
 W, H = 352, 288
 
 
+class FastTime:
+    """폐루프 timeout을 가상 시간으로 진행해 벽시계 sleep을 제거한다."""
+    now = 0.0
+
+    @classmethod
+    def reset(cls):
+        cls.now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += max(0.0, float(seconds))
+
+
 class WristSim:
     """가짜 손목캠 — 물체를 로봇 좌표에 두고, 팔 위치에서 화면 위치를 역산한다."""
 
-    def __init__(self, ref_px, ref_tcp, J, obj_xy, grip_span=0.05):
+    def __init__(self, ref_px, ref_tcp, obs_px, obs_z, J, obj_xy, grip_span=0.05):
         self.ref_px = np.array(ref_px, float)
         self.ref_tcp = np.array(ref_tcp, float)
+        self.obs_px = np.array(obs_px, float)
+        self.obs_z = float(obs_z)
         self.J = np.array(J, float)
         self.obj = np.array(obj_xy, float)     # 물체의 실제 (x, y)
         self.grip_span = grip_span             # 이 안에 들어와야 물린다 [m]
@@ -70,7 +87,10 @@ class WristSim:
         d = np.array([tcp[0] - self.ref_tcp[0], tcp[1] - self.ref_tcp[1]])
         off = np.array([self.obj[0] - self.ref_tcp[0],
                         self.obj[1] - self.ref_tcp[1]])
-        return self.ref_px + self.J @ (d - off)
+        dz = self.obs_z - self.ref_tcp[2]
+        alpha = 0.0 if abs(dz) < 1e-9 else (tcp[2] - self.ref_tcp[2]) / dz
+        z_base = self.ref_px + alpha * (self.obs_px - self.ref_px)
+        return z_base + self.J @ (d - off)
 
     def frame(self, tcp, grip_deg):
         """합성 프레임 — 물체를 흰 배경 위 빨간 사각형으로 그린다."""
@@ -96,10 +116,11 @@ class WristSim:
 def run_case(name, obj_xy, start_tcp, expect_grab=True, dry=False,
              grip_span=0.05, grip0=45.0):
     ref = arm_lib.load_gain('wrist_ref_px', 'wrist_ref_tcp', 'wrist_jac',
-                            'wrist_ref_area')
+                            'wrist_ref_area', 'wrist_obs_px', 'wrist_obs_z')
     j = ref['wrist_jac']
     J = [[j['dcx_dx'], j['dcx_dy']], [j['dcy_dx'], j['dcy_dy']]]
-    sim = WristSim(ref['wrist_ref_px'], ref['wrist_ref_tcp'], J, obj_xy,
+    sim = WristSim(ref['wrist_ref_px'], ref['wrist_ref_tcp'],
+                   ref['wrist_obs_px'], ref['wrist_obs_z'], J, obj_xy,
                    grip_span=grip_span)
 
     arm = FakeArm(tuple(start_tcp), grip0)
@@ -132,6 +153,9 @@ def run_case(name, obj_xy, start_tcp, expect_grab=True, dry=False,
     # 케이스마다 원복한다 — 안 하면 다음 호출이 **이미 패치된 함수**를 원본으로
     # 잡아 패치가 누적되고, grip_span 을 0 으로 줘도 앞 케이스의 "물렸다"가 남는다
     orig = (wc.frame, wc.tcp_now, pd.wait_gripper_settle)
+    orig_times = (pd.time, wc.time, pw.time)
+    FastTime.reset()
+    pd.time = wc.time = pw.time = FastTime
     wc.frame = fake_frame
     wc.tcp_now = tcp_now
     pw.wc = wc
@@ -140,11 +164,13 @@ def run_case(name, obj_xy, start_tcp, expect_grab=True, dry=False,
     # 그 차이를 흉내내지 않으면 성공 경로를 영영 못 밟는다.
     real_settle = pd.wait_gripper_settle
 
-    def fake_settle(timeout=35.0):
-        g = real_settle(timeout)
-        if g is not None and g < 5.0 and sim.grabbed(tcp_now()):
+    def fake_settle(timeout=35.0, **_kwargs):
+        g = real_settle(timeout, **_kwargs)
+        if _kwargs.get('target') is not None:
+            return g
+        if sim.grabbed(tcp_now()):
             return 14.9          # 큐브 두께에서 멈춘 값 (실측)
-        return g
+        return 1.0               # 빈 죠는 기구 한계까지 닫힌다
     pd.wait_gripper_settle = fake_settle
 
     old_argv, sys.argv = sys.argv, (['pick_wrist.py', '--dry'] if dry
@@ -157,6 +183,7 @@ def run_case(name, obj_xy, start_tcp, expect_grab=True, dry=False,
     finally:
         sys.argv = old_argv
         wc.frame, wc.tcp_now, pd.wait_gripper_settle = orig
+        pd.time, wc.time, pw.time = orig_times
         srv.shutdown()
         srv.server_close()
     return code, arm, sim, tcp_now

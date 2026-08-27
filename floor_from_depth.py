@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""뎁스캠 평면 피팅으로 책상면 높이를 **비접촉**으로 잰다.
+"""레거시 벤치 전용: 뎁스캠 평면 피팅으로 책상면 높이를 비접촉 측정한다.
 
 접촉 탐지(probe_floor.py)의 대체다 — 2026-08-19 접촉 방식이 판정 실패로 책상을
 3.6cm 누른 뒤, "뎁스도 되고 손목캠도 되는데 바닥 거리 하나 계산을 못하나"라는
@@ -12,8 +12,11 @@
      z 중앙값 = floor_z_m. 없으면 카메라 좌표 평면까지만 보고한다.
 
 사용:
-    python3 floor_from_depth.py            # 측정·보고만
-    python3 floor_from_depth.py --save     # servo_gain.json 의 floor_z_m 갱신
+    python3 floor_from_depth.py --legacy-bench  # 옛 벤치 구성 측정·보고만
+
+차량 프로파일은 뎁스를 쓰지 않으며 --save도 거부한다. 현재 floor_z와 probe/drop
+경계는 servo_gain.json의 vehicle_geometry에서 함께 파생하므로 이 도구로 덮어쓰면
+서로 다른 기준이 섞인다.
 
 주의: 카메라 시야에 책상면이 절반 이상 담겨야 지배 평면이 책상이다. 팔은
 시야 가장자리로 치우고(움직일 필요는 없음), 큰 물체는 치울 것.
@@ -88,9 +91,17 @@ def ransac_plane(P, iters=300, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument('--legacy-bench', action='store_true',
+                    help='Astra가 있던 이전 벤치의 읽기 전용 분석임을 명시')
     ap.add_argument('--save', action='store_true',
-                    help='측정값을 servo_gain.json 의 floor_z_m 에 저장')
+                    help='비활성 옵션(차량 프로필 오염 방지를 위해 항상 거부)')
     a = ap.parse_args()
+    if not a.legacy_bench:
+        sys.exit('차량 활성 경로는 손목캠 단독입니다. depth 바닥 측정은 비활성입니다 '
+                 '(레거시 벤치 분석만 --legacy-bench로 허용).')
+    if a.save:
+        sys.exit('레거시 depth 측정값은 차량 servo_gain.json에 저장할 수 없습니다. '
+                 '차량 작업면은 probe_floor.py로 확인하세요.')
 
     P = fetch_points()
     n, d, m = ransac_plane(P)
@@ -133,17 +144,6 @@ def main():
         sys.exit(f'측정값 {z:+.4f} 가 기대 밴드 {arm_lib.FLOOR_EXPECT_BAND} 밖 — '
                  f'저장하지 않습니다. 지배 평면이 책상이 맞는지, handeye 정합이 '
                  f'최신인지 확인하세요')
-    if a.save:
-        g = json.loads(GAIN.read_text())
-        prev = g.get('floor_z_m')
-        g['floor_z_m'] = round(z, 4)
-        g['floor_note'] = (f'{time.strftime("%Y-%m-%d")} 뎁스 평면 실측 (비접촉). '
-                           f'인라이어 {100*frac:.0f}%·기울기 {tilt:.1f}°. '
-                           f'직전값 {prev}. 베이스·책상·카메라를 옮기거나 재정합하면 다시 잴 것.')
-        for k in [k for k in g if k.startswith('stale_') and isinstance(g[k], dict)]:
-            g[k].pop('floor_z_m', None)
-        GAIN.write_text(json.dumps(g, ensure_ascii=False, indent=2) + '\n')
-        print(f'저장 → floor_z_m = {z:.4f}')
     return 0
 
 

@@ -26,11 +26,11 @@
     tilt_deg = (raw - home_tilt_raw) * 360/4096
 
 사용 ($LR = ~/miniforge3/envs/lerobot/bin/python):
-    $LR cam_calib.py --record            손으로 돌리는 동안 범위 수집 (Ctrl-C 로 종료)
-    $LR cam_calib.py --show              저장된 캘리브 보기
-    $LR cam_calib.py --set-home          지금 자세를 기준각으로 (작업대를 보는 자세에서)
-    $LR cam_calib.py --go-home           기준각으로 복귀 (정합 유효 자세)
-    $LR cam_calib.py --apply-limits      실측 범위를 서보 Min/Max_Position_Limit 에 기록
+    $LR cam_calib.py --offline --record       손으로 돌리는 동안 범위 수집
+    $LR cam_calib.py --offline --show         저장된 캘리브 보기
+    $LR cam_calib.py --offline --set-home     지금 자세를 기준각으로
+    $LR cam_calib.py --offline --go-home      기준각으로 복귀
+    $LR cam_calib.py --offline --apply-limits 실측 범위를 서보 제한에 기록
 """
 import argparse
 import json
@@ -47,6 +47,7 @@ except ModuleNotFoundError as e:                   # lerobot 이 없는 인터�
         f'{e}\n\n이 스크립트는 lerobot 환경 파이썬으로 실행해야 합니다:\n'
         f'  ~/miniforge3/envs/lerobot/bin/python {__file__} ...') from None
 import cam_servo as cs                             # noqa: E402
+from maintenance_transaction import MaintenanceTransaction  # noqa: E402
 
 CALIB = HERE / 'cam_calib.json'
 MARGIN_RAW = 20        # 실측 끝에서 안쪽으로 남기는 여유 — 손으로 잰 끝은 이미
@@ -65,6 +66,14 @@ def save(d):
 def read_raw(bus, name):
     _deg, raw = cs.raw_deg(bus, name)
     return int(round(raw))
+
+
+def finalize_bus_ownership(bus):
+    """검증된 serial close 뒤에만 cam_calib의 authority를 해제한다."""
+    authority = getattr(bus, '_device_authority', None)
+    if authority is None:
+        raise RuntimeError('camera bus authority가 없어 안전한 종료를 증명할 수 없습니다')
+    cs.finalize_bus_ownership(bus, authority)
 
 
 WRAP_JUMP = 3000       # 이보다 큰 표본 간 점프만 경계 넘음으로 본다
@@ -102,7 +111,7 @@ def cmd_record(bus, seconds=None):
     print('  케이블이 팽팽해지거나 어딘가 닿으면 **그 앞에서 멈추세요** — 그 지점이 한계입니다.')
     print(f'  {f"{seconds:.0f}초 뒤 자동 종료" if seconds else "다 되면 Ctrl-C"}\n')
     for name in cs.NAMES.values():
-        bus.write('Torque_Enable', name, 0, normalize=False)
+        cs.write_verified(bus, 'Torque_Enable', name, 0)
     seen = {n: [] for n in cs.NAMES.values()}
     dropped = {n: 0 for n in cs.NAMES.values()}
     t_end = time.monotonic() + seconds if seconds else None
@@ -212,38 +221,54 @@ def cmd_go_home(bus):
         print(f'{name}: raw {int(raw)} (기준 {target_raw}) {mark}')
 
 
-def cmd_apply_limits(bus):
+def cmd_apply_limits(bus, device=None):
     d = load()
     rng = d.get('range')
     if not rng:
         sys.exit('실측 범위가 없습니다 — 먼저 --record 로 기록하세요')
+    intended = {}
     for name, r in rng.items():
         lo = max(0, r['raw_min'] + MARGIN_RAW)
         hi = min(4095, r['raw_max'] - MARGIN_RAW)
         if hi - lo < 40:
             print(f'⚠ {name}: 범위가 너무 좁아({lo}~{hi}) 건너뜁니다')
             continue
+        intended[name] = (lo, hi)
+    if not intended:
+        raise RuntimeError('적용 가능한 카메라 서보 범위가 없습니다')
+
+    device = device or getattr(bus, 'port', None)
+    if device is None:
+        raise RuntimeError('maintenance marker에 사용할 장치 경로가 없습니다')
+    authority = getattr(bus, '_device_authority', None)
+    tx = MaintenanceTransaction(
+        authority.port if authority is not None else device,
+        'camera position limits', scope='camera-pan-tilt',
+        authority=authority)
+    all_axes = tuple(cs.NAMES.values())
+    tx.begin(bus, all_axes)
+    previous = {}
+    for name, (lo, hi) in intended.items():
         cur_lo = int(bus.read('Min_Position_Limit', name, normalize=False))
         cur_hi = int(bus.read('Max_Position_Limit', name, normalize=False))
-        bus.write('Torque_Enable', name, 0, normalize=False)
-        time.sleep(0.05)
-        try:
-            bus.write('Lock', name, 0, normalize=False)
-            time.sleep(0.05)
-        except Exception:
-            pass
-        bus.write('Min_Position_Limit', name, lo, normalize=False)
-        bus.write('Max_Position_Limit', name, hi, normalize=False)
-        time.sleep(0.05)
-        got_lo = int(bus.read('Min_Position_Limit', name, normalize=False))
-        got_hi = int(bus.read('Max_Position_Limit', name, normalize=False))
-        try:
-            bus.write('Lock', name, 1, normalize=False)
-        except Exception:
-            pass
-        ok = (got_lo, got_hi) == (lo, hi)
-        print(f'{name}: 제한 {cur_lo}~{cur_hi} → {got_lo}~{got_hi} '
-              f'{"✅" if ok else "❌ 확인 불일치"}')
+        previous[name] = (cur_lo, cur_hi)
+        tx.write_verified(bus, 'Lock', name, 0)
+        tx.write_verified(bus, 'Min_Position_Limit', name, lo)
+        tx.write_verified(bus, 'Max_Position_Limit', name, hi)
+        tx.write_verified(bus, 'Lock', name, 1)
+
+    # 성공 메타데이터를 쓰기 전에 의도한 전체 상태를 다시 읽는다.
+    for name in all_axes:
+        tx.verify(bus, 'Torque_Enable', name, 0)
+    for name, (lo, hi) in intended.items():
+        tx.verify(bus, 'Min_Position_Limit', name, lo)
+        tx.verify(bus, 'Max_Position_Limit', name, hi)
+        tx.verify(bus, 'Lock', name, 1)
+    tx.complete()
+
+    for name, (lo, hi) in intended.items():
+        cur_lo, cur_hi = previous[name]
+        print(f'{name}: 제한 {cur_lo}~{cur_hi} → {lo}~{hi} ✅')
     d['limits_applied'] = True
     d['limits_note'] = (f'실측 범위에서 안쪽으로 {MARGIN_RAW} raw 여유를 두고 서보 '
                         f'Min/Max_Position_Limit 에 기록. 제한 밖 목표는 서보가 조용히 '
@@ -273,7 +298,9 @@ def cmd_show(bus):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--force', action='store_true',
-                    help='패널 서버가 떠 있어도 버스를 연다 (경합 각오)')
+                    help='호환 옵션(동시 소유 우회 불가)')
+    ap.add_argument('--offline', action='store_true',
+                    help='패널/Worker가 내려간 유지보수 전용 모드 확인')
     ap.add_argument('--port', default=None)
     ap.add_argument('--record', action='store_true')
     ap.add_argument('--seconds', type=float, default=None,
@@ -284,11 +311,15 @@ def main():
                     help='기준각으로 복귀 (정합이 유효한 자세)')
     ap.add_argument('--show', action='store_true')
     a = ap.parse_args()
+    if not a.offline:
+        sys.exit('독립 시리얼 유지보수는 --offline을 명시해야 합니다')
 
     port = a.port or arm_lib.find_arm_port()
     if port is None:
         sys.exit('시리얼 포트를 찾지 못했습니다 — --port 로 지정하세요')
-    bus = cs.open_bus(port, force=a.force)
+    bus = cs.open_bus(
+        port, force=a.force, offline=True,
+        maintenance_recovery=('camera-pan-tilt' if a.apply_limits else None))
     try:
         if a.record:
             cmd_record(bus, a.seconds)
@@ -297,14 +328,11 @@ def main():
         elif a.go_home:
             cmd_go_home(bus)
         elif a.apply_limits:
-            cmd_apply_limits(bus)
+            cmd_apply_limits(bus, port)
         else:
             cmd_show(bus)
     finally:
-        try:
-            bus.port_handler.closePort()
-        except Exception:
-            pass
+        finalize_bus_ownership(bus)
 
 
 if __name__ == '__main__':

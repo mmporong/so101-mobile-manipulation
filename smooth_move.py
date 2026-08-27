@@ -30,11 +30,23 @@ MARGIN_DEG = 2.6   # 패널 LIMIT_MARGIN_DEG(2.0)보다 커야 한다 — 작으
 SMOOTHSTEP_MAX_SLOPE = 1.5
 
 
+class CommandRejected(RuntimeError):
+    """서버가 HTTP 200 본문에서 명령을 명시적으로 거부했다."""
+
+
 def _post(op, timeout=3.0, **kw):
     r = urllib.request.Request(f'{BASE}/cmd', method='POST',
                                data=json.dumps(dict(op=op, **kw)).encode(),
                                headers={'Content-Type': 'application/json'})
-    return json.load(urllib.request.urlopen(r, timeout=timeout))
+    body = json.load(urllib.request.urlopen(r, timeout=timeout))
+    if not isinstance(body, dict):
+        raise CommandRejected(f'{op} 응답이 JSON object가 아닙니다')
+    status = body.get('status')
+    if body.get('ok') is not True or status not in (
+            'accepted', 'executing', 'completed'):
+        reason = body.get('reason') or body.get('msg') or status or '응답 형식 오류'
+        raise CommandRejected(f'{op} 서버 거부: {reason}')
+    return body
 
 
 def _state(timeout=3.0):
@@ -56,9 +68,8 @@ def _bounds():
                      'so_follower/follower.json').expanduser()
     c = json.loads(p.read_text())
     b = {}
-    for i, j in enumerate(J5):
+    for j in J5:
         e = c[j]
-        mid = (e['range_min'] + e['range_max']) / 2
         half = (e['range_max'] - e['range_min']) / 2 * 360.0 / 4095.0
         b[j] = (-half + MARGIN_DEG, half - MARGIN_DEG)
     return b
@@ -157,6 +168,8 @@ def stream(ticks, hz=15.0, z_floor=None):
             try:
                 _post('pose', joints={j: round(tk[j], 2) for j in J5}, timeout=2.0)
                 send_fail = 0
+            except CommandRejected:
+                raise
             except Exception as e:
                 send_fail += 1                    # 단발 유실은 다음 틱이 덮는다
                 if send_fail >= 3:

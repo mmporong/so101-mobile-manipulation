@@ -26,6 +26,9 @@ import math
 import pathlib
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 HERE = pathlib.Path(__file__).parent
 MAPPING = HERE / 'mapping.json'
@@ -41,9 +44,12 @@ JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_ro
 
 # 책상면 높이(floor_z_m)로 받아들일 수 있는 밴드 [m]. 측정 도구(probe_floor·
 # floor_from_depth)가 공유한다 — 이 밖의 값은 지배 평면 오인·정합 노후 등
-# 측정 실패이므로 저장하지 않는다. 실측 근거: -0.078 ± 여유 (2026-08-19 확정).
-# 책상·베이스를 크게 옮기면 이 밴드부터 갱신할 것.
-FLOOR_EXPECT_BAND = (-0.095, -0.060)
+# 측정 실패이므로 저장하지 않는다. 차량 프로필의 현재 작업면을 중심으로 계산한다.
+_BOOT_GAIN = json.loads(GAIN.read_text())
+_BOOT_FLOOR = float(_BOOT_GAIN['floor_z_m'])
+_BOOT_FLOOR_HALF = float(_BOOT_GAIN['vehicle_geometry']['floor_expect_half_width_m'])
+FLOOR_EXPECT_BAND = (_BOOT_FLOOR - _BOOT_FLOOR_HALF,
+                     _BOOT_FLOOR + _BOOT_FLOOR_HALF)
 
 DEFAULT_MAPPING = {
     'signs':   {j: 1 for j in JOINTS},
@@ -103,6 +109,21 @@ def load_gain(*required):
     return g
 
 
+def vehicle_geometry():
+    """차량 작업면·받침대·반납 상자에서 파생되는 좌표를 한 번에 반환한다."""
+    g = load_gain('floor_z_m', 'vehicle_geometry')
+    cfg = dict(g['vehicle_geometry'])
+    floor = float(g['floor_z_m'])
+    half = float(cfg['floor_expect_half_width_m'])
+    rim = floor + float(cfg['box_rim_height_m'])
+    return dict(cfg, floor_z_m=floor,
+                floor_expect_band=(floor - half, floor + half),
+                probe_start_z=floor + float(cfg['probe_start_clearance_m']),
+                probe_min_z=floor - float(cfg['probe_limit_below_floor_m']),
+                drop_transit_z=rim + float(cfg['drop_transit_clearance_m']),
+                drop_release_z=rim + float(cfg['drop_release_clearance_m']))
+
+
 # 물체·죠 기하 — 파지 스크립트와 교시 스크립트가 **같은 값**을 봐야 한다.
 # 한쪽에만 두면 어긋난 순간 교시 높이와 파지 높이가 달라져 기준이 무효가 된다.
 OBJ_H_M = 0.040        # 물체 높이 [m] — 4×4cm 큐브
@@ -156,17 +177,14 @@ def servo_to_rad(obs, mapping):
 
 
 def port_identity(dev):
-    """시리얼 장치의 udev 신원 — {'model_id','vendor_id','serial'} (실패 시 {})."""
-    import subprocess
-    try:
-        out = subprocess.run(['udevadm', 'info', '-q', 'property', '-n', dev],
-                             capture_output=True, text=True, timeout=3.0).stdout
-    except Exception:
-        return {}
-    kv = dict(l.split('=', 1) for l in out.splitlines() if '=' in l)
+    """시리얼 장치의 udev 신원. serial 우선, 물리 USB path를 보조로 쓴다."""
+    from hardware_authority import udev_properties
+    kv = udev_properties(dev)
     return {'model_id': kv.get('ID_MODEL_ID', ''),
             'vendor_id': kv.get('ID_VENDOR_ID', ''),
             'serial': kv.get('ID_SERIAL_SHORT', ''),
+            'serial_id': kv.get('ID_SERIAL', ''),
+            'path': kv.get('ID_PATH', ''),
             'model': kv.get('ID_MODEL', '')}
 
 
@@ -209,7 +227,14 @@ def remember_arm_port(dev):
     ident = port_identity(dev)
     if not ident.get('model_id'):
         return None
-    keep = {k: ident[k] for k in ('vendor_id', 'model_id', 'serial') if ident.get(k)}
+    if ident.get('serial_id'):
+        keep = {'serial_id': ident['serial_id']}
+    elif ident.get('serial'):
+        keep = {k: ident[k] for k in ('vendor_id', 'model_id', 'serial')
+                if ident.get(k)}
+    else:
+        keep = {k: ident[k] for k in ('vendor_id', 'model_id', 'path')
+                if ident.get(k)}
     g = json.loads(GAIN.read_text()) if GAIN.exists() else {}
     if g.get('arm_port_id') == keep:
         return keep
@@ -222,33 +247,121 @@ def remember_arm_port(dev):
     return keep
 
 
-def connect(port='/dev/ttyACM0', robot_id='follower', max_step_deg=5.0):
-    """팔로워 연결. max_step_deg 가 한 명령의 이동 상한 — 폭주 방지 안전장치다.
+DEFAULT_WORKER_API = 'http://127.0.0.1:8765'
+TERMINAL_STATUSES = frozenset(('completed', 'rejected'))
 
-    캘리브레이션 파일이 없으면 lerobot 이 대화형 캘리브레이션을 시작해 버리므로,
-    미리 확인해 명확한 에러로 바꾼다.
+
+class WorkerCommandError(RuntimeError):
+    """패널/Worker가 명령을 추적·완료하지 못했거나 명시적으로 거부했다."""
+
+
+def connect(*_args, **_kwargs):
+    """폐기된 직접 팔로워 연결 API.
+
+    실물 구동 권위는 ``arm_gui.Worker`` 하나뿐이다. 이 함수는 장치·lerobot 객체를
+    만들기 전에 항상 거부하여 과거 스크립트가 dirty marker, 베이스 인터록,
+    STOP epoch, 팬 잠금과 보호 프로필을 우회하지 못하게 한다.
     """
-    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-    cfg = SO101FollowerConfig(port=port, id=robot_id, max_relative_target=max_step_deg)
-    robot = SO101Follower(cfg)
-    if not robot.is_calibrated:
-        raise SystemExit(
-            f'캘리브레이션이 없습니다 (id={robot_id}).\n'
-            f'먼저: lerobot-calibrate --robot.type=so101_follower '
-            f'--robot.port={port} --robot.id={robot_id}')
-    robot.connect(calibrate=False)
-    return robot
+    raise WorkerCommandError(
+        '직접 팔로워 연결은 폐기되었습니다 — 실행 중인 패널 Worker API를 사용하세요')
 
 
-def slow_move(robot, target_action, seconds=2.0, hz=50):
-    """현재 자세에서 목표까지 보간 이동. 한 번에 점프하지 않는다."""
-    obs = robot.get_observation()
-    cur = {k: obs[k] for k in target_action if k in obs}
-    steps = max(2, int(seconds * hz))
-    for i in range(1, steps + 1):
-        a = i / steps
-        # smoothstep — 시작·끝을 부드럽게
-        s = a * a * (3 - 2 * a)
-        robot.send_action({k: cur[k] + (target_action[k] - cur[k]) * s
-                           for k in target_action})
-        time.sleep(1.0 / hz)
+def slow_move(*_args, **_kwargs):
+    """폐기된 직접 action 송신 API. Worker 추적 명령만 허용한다."""
+    raise WorkerCommandError(
+        '직접 action 송신은 폐기되었습니다 — worker_submit_wait()를 사용하세요')
+
+
+def worker_state(api=DEFAULT_WORKER_API, timeout=2.0):
+    """패널 Worker 상태를 읽는다. 패널이 없으면 하드웨어 생성 없이 실패한다."""
+    try:
+        with urllib.request.urlopen(f'{api.rstrip("/")}/state',
+                                    timeout=float(timeout)) as response:
+            body = json.load(response)
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        raise WorkerCommandError(f'패널 Worker 상태 확인 실패: {e}') from e
+    if not isinstance(body, dict):
+        raise WorkerCommandError('패널 Worker 상태 응답이 JSON object가 아닙니다')
+    return body
+
+
+def worker_command_status(command_id, api=DEFAULT_WORKER_API, timeout=2.0):
+    """공개 API로 특정 Worker 명령의 현재 상태를 읽는다."""
+    command_id = str(command_id)
+    if not command_id or len(command_id) > 128:
+        raise WorkerCommandError('유효한 Worker command_id가 필요합니다')
+    query = urllib.parse.urlencode({'id': command_id})
+    try:
+        with urllib.request.urlopen(
+                f'{api.rstrip("/")}/command?{query}',
+                timeout=float(timeout)) as response:
+            body = json.load(response)
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        raise WorkerCommandError(f'Worker 명령 상태 확인 실패: {e}') from e
+    if not isinstance(body, dict) or body.get('id') != command_id:
+        raise WorkerCommandError('Worker 명령 상태 응답의 command_id가 일치하지 않습니다')
+    return body
+
+
+def worker_submit_wait(op, *, api=DEFAULT_WORKER_API, wait_timeout=30.0,
+                       request_timeout=3.0, require_applied=False,
+                       expected_worker_op=None, **payload):
+    """패널에 명령을 제출하고 같은 command_id의 terminal 결과까지 기다린다.
+
+    성공은 ``completed``와 (요구 시) ``applied_action`` 원증거가 모두 있어야 한다.
+    accepted 응답만 받고 성공으로 간주하거나 ``/state.last_command``를 추측하지
+    않으므로 동시 명령과 STOP epoch 전환에서도 다른 명령을 오인하지 않는다.
+    """
+    if not isinstance(op, str) or not op:
+        raise ValueError('비어 있지 않은 Worker op가 필요합니다')
+    expected_worker_op = op if expected_worker_op is None else str(expected_worker_op)
+    if not expected_worker_op:
+        raise ValueError('비어 있지 않은 expected_worker_op가 필요합니다')
+    wait_timeout = float(wait_timeout)
+    request_timeout = float(request_timeout)
+    if not math.isfinite(wait_timeout) or wait_timeout <= 0:
+        raise ValueError('wait_timeout은 유한한 양수여야 합니다')
+    if not math.isfinite(request_timeout) or request_timeout <= 0:
+        raise ValueError('request_timeout은 유한한 양수여야 합니다')
+    request = urllib.request.Request(
+        f'{api.rstrip("/")}/cmd', method='POST',
+        data=json.dumps(dict(payload, op=op)).encode(),
+        headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
+            accepted = json.load(response)
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        raise WorkerCommandError(f'{op} 제출 실패: {e}') from e
+    if not isinstance(accepted, dict):
+        raise WorkerCommandError(f'{op} 제출 응답이 JSON object가 아닙니다')
+    command_id = accepted.get('command_id')
+    if not isinstance(command_id, str) or not command_id:
+        reason = accepted.get('reason') or accepted.get('msg') or accepted.get('error')
+        raise WorkerCommandError(f'{op} 제출 거부: {reason or "command_id 없음"}')
+
+    deadline = time.monotonic() + wait_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WorkerCommandError(f'{op} terminal 대기 시간 초과: {command_id}')
+        status = worker_command_status(
+            command_id, api=api, timeout=min(request_timeout, remaining))
+        phase = status.get('status')
+        if status.get('op') != expected_worker_op:
+            raise WorkerCommandError(
+                f'Worker terminal op 불일치: 기대={expected_worker_op}, '
+                f'응답={status.get("op")!r}')
+        epoch = status.get('epoch')
+        if type(epoch) is not int or epoch < 0:
+            raise WorkerCommandError(f'{op} 명령에 유효한 actuation epoch가 없습니다')
+        if phase not in ('accepted', 'executing', *TERMINAL_STATUSES):
+            raise WorkerCommandError(f'{op} 명령 상태가 유효하지 않습니다: {phase!r}')
+        if phase == 'rejected':
+            raise WorkerCommandError(
+                f'{op} Worker 거부: {status.get("reason") or "사유 없음"}')
+        if phase == 'completed':
+            applied = status.get('applied_action')
+            if require_applied and (not isinstance(applied, dict) or not applied):
+                raise WorkerCommandError(f'{op} 완료에 applied_action 원증거가 없습니다')
+            return status
+        time.sleep(min(0.05, max(0.001, remaining)))

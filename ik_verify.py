@@ -18,7 +18,7 @@
     # 2) 자로 잰 TCP 위치를 기록 (같은 좌표계로)
     python3 ik_verify.py 0.20 0.05 -0.05 --measured 0.203 0.048 -0.055
 
-    # 3) 홈 자세 복귀
+    # 3) 차량 홈 자세 복귀 (실행 중인 패널 Worker 필요)
     python3 ik_verify.py --home
 """
 import argparse
@@ -30,10 +30,6 @@ import time
 import arm_lib
 
 LOG = pathlib.Path(__file__).parent / 'ik_verify_log.json'
-
-# 자연스러운 대기 자세 (URDF rad) — 팔을 살짝 접고 죠는 전방 아래
-HOME_Q = [0.0, -0.3, 0.6, 0.5, 0.0]
-
 
 def to_bf(p):
     return tuple(p[i] + arm_lib.PAN0[i] for i in range(3))
@@ -49,20 +45,23 @@ def main():
     ap.add_argument('--pitch', type=float, default=-90.0, help='죠 피치[deg], 기본 수직')
     ap.add_argument('--measured', nargs=3, type=float, help='자로 잰 TCP (pan 축 기준, m)')
     ap.add_argument('--home', action='store_true')
-    ap.add_argument('--port', default='/dev/ttyACM0')
-    ap.add_argument('--id', default='follower')
+    ap.add_argument('--api', default=arm_lib.DEFAULT_WORKER_API,
+                    help='실행 중인 패널 Worker API')
+    ap.add_argument('--port', help=argparse.SUPPRESS)
+    ap.add_argument('--id', help=argparse.SUPPRESS)
     a = ap.parse_args()
+
+    if a.port is not None or a.id is not None:
+        ap.error('--port/--id 직접 연결은 폐기되었습니다. --api로 패널 Worker를 지정하세요')
 
     mapping = arm_lib.load_mapping()
     K = arm_lib.load_kinematics()
 
     if a.home:
-        robot = arm_lib.connect(a.port, a.id)
-        try:
-            arm_lib.slow_move(robot, arm_lib.rad_to_servo(HOME_Q, mapping), seconds=2.5)
-            print('홈 자세 복귀 완료')
-        finally:
-            robot.disconnect()
+        terminal = arm_lib.worker_submit_wait(
+            'home', api=a.api, wait_timeout=45.0, require_applied=True,
+            expected_worker_op='move_q')
+        print(f'홈 자세 복귀 완료 · {terminal["id"]}')
         return
 
     if len(a.xyz) != 3:
@@ -102,20 +101,23 @@ def main():
         print(f'기록 {len(hist)}건 → {LOG}')
         return
 
-    robot = arm_lib.connect(a.port, a.id)
-    try:
-        arm_lib.slow_move(robot, arm_lib.rad_to_servo(q, mapping), seconds=3.0)
-        time.sleep(0.5)
-        obs = robot.get_observation()
-        q_now = arm_lib.servo_to_rad(obs, mapping)
-        fk_now = to_pan(K.fk_pos(q_now))
-        print(f'도달 후 관절각 : {[round(v, 4) for v in q_now]}')
-        print(f'관절 기준 TCP  : ({fk_now[0]:+.4f}, {fk_now[1]:+.4f}, {fk_now[2]:+.4f}) '
-              f'← 서보가 실제로 간 각도로 계산한 위치')
-        print()
-        print('이제 죠 끝(TCP)을 자로 재고, 같은 명령에 --measured x y z 를 붙여 기록하세요')
-    finally:
-        robot.disconnect()
+    terminal = arm_lib.worker_submit_wait(
+        'ik', api=a.api, wait_timeout=60.0, require_applied=True,
+        expected_worker_op='move_q',
+        x=tgt_pan[0], y=tgt_pan[1], z=tgt_pan[2], pitch=a.pitch)
+    applied = terminal['applied_action']
+    missing = [joint for joint in arm_lib.JOINTS if joint not in applied]
+    if missing:
+        raise arm_lib.WorkerCommandError(
+            f'IK 완료 applied_action에 관절이 누락되었습니다: {missing}')
+    q_applied = arm_lib.servo_to_rad(
+        {f'{joint}.pos': applied[joint] for joint in arm_lib.JOINTS}, mapping)
+    fk_applied = to_pan(K.fk_pos(q_applied))
+    print(f'적용된 관절각   : {[round(v, 4) for v in q_applied]}')
+    print(f'적용 명령 TCP   : ({fk_applied[0]:+.4f}, {fk_applied[1]:+.4f}, '
+          f'{fk_applied[2]:+.4f}) · {terminal["id"]}')
+    print()
+    print('이제 죠 끝(TCP)을 자로 재고, 같은 명령에 --measured x y z 를 붙여 기록하세요')
 
 
 if __name__ == '__main__':

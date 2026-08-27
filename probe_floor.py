@@ -27,61 +27,283 @@
 그래서 **롤링 중앙값(최근 6점) 대비 편차 ±DEV_MARGIN, 연속 2회**로 잡는다 —
 하락이든 상승이든. 한 번에 |편차|가 HARD_DEV 를 넘으면 즉시 정지.
 
-사용: python3 probe_floor.py [x] [y]      기본 0.20 0.00
+사용: python3 probe_floor.py --offline [x] [y]      기본 0.20 0.00
 """
+import argparse
 import json
 import pathlib
 import sys
 import time
 
-import glob
-
 HERE = pathlib.Path(__file__).parent
-Z_START = -0.05          # 여기서부터 내려간다 (2026-08-19 실측: 새 좌표계에서
-                         # 죠가 책상에 닿은 안착 자세의 TCP z ≈ -0.078 — 3cm 위)
-Z_MIN = -0.090           # 판정이 통째로 실패해도 여기서 선다 — 기대 책상면(-0.078)
-                         # 보다 12mm 아래. 종전 -0.12 는 하필 1차 사고의 눌림 깊이와
-                         # 같았다(리뷰 M6-1). 이 스크립트의 임무는 미지 탐색이 아니라
-                         # **아는 값의 확인**이므로 최후 방어선을 기대값에 건다.
 # 확정값이 이 밖이면 측정을 의심하고 저장하지 않는다 — 밴드는 arm_lib 에서
 # 공유한다 (floor_from_depth 와 같은 값이어야 두 측정법이 같은 기준으로 걸러진다)
 sys.path.insert(0, str(HERE))
 import arm_lib  # noqa: E402
+from hardware_authority import acquire_device
+from maintenance_transaction import (
+    MaintenanceTransaction,
+    compensate_exact_torque_off,
+    read_exact,
+    sync_write_verified,
+)
 
-EXPECT_BAND = arm_lib.FLOOR_EXPECT_BAND
+GEOMETRY = arm_lib.vehicle_geometry()
+Z_START = GEOMETRY['probe_start_z']
+Z_MIN = GEOMETRY['probe_min_z']
+EXPECT_BAND = GEOMETRY['floor_expect_band']
 STEP = 0.002             # 한 스텝 2mm
 DEV_MARGIN = 32          # 롤링 중앙값 대비 이만큼 벗어나면 접촉 후보
                          # (자유 하강 잡음 ±20 실측의 1.6배)
 DEV_HOLD = 2             # 연속 확인 횟수
 HARD_DEV = 100           # 한 번에 이만큼 벗어나면 즉시 정지
 BACKOFF = 0.012          # 접촉 시작점 위로 이만큼 후퇴
+GOAL_VERIFY_TOL_DEG = 360.0 / 4095.0 + 1e-6
+GOAL_REACHED_TOL_DEG = 2.0
+_FAILED_OPEN_SESSIONS = []
+
+
+def connect_bus_once(bus):
+    """connect API를 호출 전에 선택해 내부 AttributeError 재호출을 막는다."""
+    connect = getattr(bus, '_connect', None)
+    if not callable(connect):
+        connect = getattr(bus, 'connect')
+    return connect(handshake=False)
+
+
+def configure_probe_bus(bus, motors, device):
+    """접촉 이동 전에 EEPROM/RAM 설정을 모두 read-back으로 확정한다."""
+    names = tuple(motors)
+    authority = getattr(bus, '_device_authority', None)
+    tx = MaintenanceTransaction(
+        authority.port if authority is not None else device,
+        'probe_floor velocity limits', scope='probe-floor-arm',
+        authority=authority)
+    tx.begin(bus, names)
+    for motor in names:
+        tx.write_verified(bus, 'Maximum_Velocity_Limit', motor, 254)
+    for motor in names:
+        tx.verify(bus, 'Maximum_Velocity_Limit', motor, 254)
+        tx.verify(bus, 'Torque_Enable', motor, 0)
+    tx.complete()
+
+    try:
+        sync_write_verified(bus, 'Goal_Velocity', {m: 40 for m in names})
+        sync_write_verified(bus, 'Acceleration', {m: 10 for m in names})
+        sync_write_verified(bus, 'Torque_Limit', {m: 350 for m in names})
+        raw = bus.sync_read('Present_Position', names, normalize=False)
+        sync_write_verified(bus, 'Goal_Position', raw)
+        for motor in names:
+            sync_write_verified(bus, 'Torque_Enable', {motor: 1})
+        for motor in names:
+            read_exact(bus, 'Goal_Velocity', motor, 40)
+            read_exact(bus, 'Acceleration', motor, 10)
+            read_exact(bus, 'Torque_Limit', motor, 350)
+            read_exact(bus, 'Goal_Position', motor, raw[motor])
+            read_exact(bus, 'Torque_Enable', motor, 1)
+    except Exception as original:
+        try:
+            compensate_exact_torque_off(bus, names)
+        except Exception as compensation:
+            raise RuntimeError(
+                'probe 설정 실패 후 exact-OFF 보상도 실패: '
+                f'원인={type(original).__name__}: {original}; '
+                f'보상={type(compensation).__name__}: {compensation}') from original
+        raise
+
+
+def write_goal_verified(bus, values):
+    """정규화 위치 목표의 silent no-op을 즉시 검출한다."""
+    bus.sync_write('Goal_Position', values)
+    got = bus.sync_read('Goal_Position', tuple(values))
+    for motor, expected in values.items():
+        # LeRobot은 max_res=4095로 degree를 왕복하므로 최대 약 1 tick
+        # (360/4095°) 양자화된다. 그 범위만 허용하고 silent no-op은 잡는다.
+        if abs(float(got[motor]) - float(expected)) > GOAL_VERIFY_TOL_DEG:
+            raise RuntimeError(
+                f'{motor}.Goal_Position read-back {got[motor]} != {expected}')
+
+
+def wait_goal_reached(bus, values, timeout_s, *, poll_s=0.05):
+    """목표 register ACK 뒤 실제 위치 도달까지 bounded 대기한다."""
+    deadline = time.monotonic() + float(timeout_s)
+    motors = tuple(values)
+    while True:
+        actual = bus.sync_read('Present_Position', motors)
+        if all(abs(float(actual[m]) - float(values[m])) <= GOAL_REACHED_TOL_DEG
+               for m in motors):
+            return actual
+        if time.monotonic() >= deadline:
+            gaps = {m: round(abs(float(actual[m]) - float(values[m])), 2)
+                    for m in motors}
+            raise TimeoutError(f'probe 목표 도달 시간 초과: {gaps}')
+        time.sleep(poll_s)
+
+
+def cleanup_probe_motion(bus, motors):
+    """통전 가능 축을 현재 raw hold로 증명하고, 실패하면 전축 exact OFF한다."""
+    names = tuple(motors)
+    energized = []
+    for motor in names:
+        try:
+            if int(bus.read('Torque_Enable', motor, normalize=False)) != 0:
+                energized.append(motor)
+        except Exception:
+            energized.append(motor)
+    if not energized:
+        return 'off'
+    try:
+        raw = bus.sync_read(
+            'Present_Position', tuple(energized), normalize=False)
+        sync_write_verified(
+            bus, 'Goal_Position', {m: int(raw[m]) for m in energized})
+        return 'held'
+    except Exception as hold_exc:
+        try:
+            compensate_exact_torque_off(bus, energized)
+            return 'torque_off'
+        except Exception as off_exc:
+            raise RuntimeError(
+                'probe cleanup hold/OFF 모두 미확인: '
+                f'hold={type(hold_exc).__name__}: {hold_exc}; '
+                f'OFF={type(off_exc).__name__}: {off_exc}') from hold_exc
+
+
+def bus_closed(bus):
+    evidence = []
+    if hasattr(bus, 'is_connected'):
+        value = getattr(bus, 'is_connected')
+        value = value() if callable(value) else value
+        evidence.append(bool(value))
+    handler = getattr(bus, 'port_handler', None)
+    if handler is not None and hasattr(handler, 'is_open'):
+        value = getattr(handler, 'is_open')
+        value = value() if callable(value) else value
+        evidence.append(bool(value))
+    if not evidence:
+        raise RuntimeError('probe serial close 상태 증거 없음')
+    return not any(evidence)
+
+
+def close_bus_verified(bus):
+    failures = []
+    try:
+        bus.disconnect(disable_torque=False)
+    except BaseException as exc:
+        failures.append(f'disconnect {type(exc).__name__}: {exc}')
+    try:
+        if bus_closed(bus):
+            return
+    except BaseException as exc:
+        failures.append(f'close verify {type(exc).__name__}: {exc}')
+    handler = getattr(bus, 'port_handler', None)
+    if handler is not None:
+        try:
+            handler.closePort()
+        except BaseException as exc:
+            failures.append(f'closePort {type(exc).__name__}: {exc}')
+        try:
+            if bus_closed(bus):
+                return
+        except BaseException as exc:
+            failures.append(f'close verify {type(exc).__name__}: {exc}')
+    if not failures:
+        failures.append('silent close failure: port remains open')
+    raise RuntimeError('; '.join(failures))
+
+
+def finalize_probe(bus, motors, authority):
+    """안전 종결 뒤 serial close가 증명된 경우에만 authority를 해제한다."""
+    active_error = sys.exc_info()[1]
+    cleanup_error = None
+    ownership_error = None
+    try:
+        cleanup_probe_motion(bus, motors)
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        close_bus_verified(bus)
+    except BaseException as exc:
+        ownership_error = exc
+    else:
+        try:
+            authority.release()
+        except BaseException as exc:
+            ownership_error = exc
+    if cleanup_error is not None or ownership_error is not None:
+        details = []
+        if active_error is not None:
+            details.append(f'원 예외={type(active_error).__name__}: {active_error}')
+        if cleanup_error is not None:
+            details.append(f'안전 종결={type(cleanup_error).__name__}: {cleanup_error}')
+        if ownership_error is not None:
+            details.append(f'소유권 종결={type(ownership_error).__name__}: {ownership_error}')
+        cause = cleanup_error or ownership_error or active_error
+        raise RuntimeError('probe 종료 실패: ' + '; '.join(details)) from cause
+
+
+def finalize_partial_open(bus, authority, connect_exc):
+    """probe connect 예외 뒤 verified close 전에는 lock/ref를 보존한다."""
+    try:
+        close_bus_verified(bus)
+    except BaseException as close_exc:
+        _FAILED_OPEN_SESSIONS.append((bus, authority, connect_exc, close_exc))
+        raise RuntimeError(
+            'probe partial-open 종료 미확인; authority 유지, 재open 금지: '
+            f'connect={type(connect_exc).__name__}: {connect_exc}; '
+            f'close={type(close_exc).__name__}: {close_exc}') from close_exc
+    authority.release()
+    if getattr(bus, '_device_authority', None) is authority:
+        bus._device_authority = None
 
 
 def main():
-    x = float(sys.argv[1]) if len(sys.argv) > 1 else 0.20
-    y = float(sys.argv[2]) if len(sys.argv) > 2 else 0.00
+    if _FAILED_OPEN_SESSIONS:
+        raise RuntimeError(
+            '이전 probe partial-open의 serial close가 미확인입니다; '
+            '프로세스를 종료해 FD를 정리하기 전에는 다시 열 수 없습니다')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('x', nargs='?', type=float, default=0.20)
+    parser.add_argument('y', nargs='?', type=float, default=0.00)
+    parser.add_argument('--offline', action='store_true',
+                        help='패널/Worker가 내려간 유지보수 전용 모드 확인')
+    args = parser.parse_args()
+    if not args.offline:
+        parser.error('독립 시리얼 유지보수는 --offline을 명시해야 합니다')
+    x, y = args.x, args.y
 
     K = arm_lib.load_kinematics()
     import math
     from lerobot.motors.feetech import FeetechMotorsBus
     from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 
-    port = sorted(glob.glob('/dev/ttyACM*'))[0]
+    port = arm_lib.find_arm_port()
+    if port is None:
+        sys.exit('신원이 확인된 SO-101 팔 포트를 찾지 못했습니다')
     ARM = arm_lib.JOINTS
     motors = {j: Motor(i + 1, 'sts3215', MotorNormMode.DEGREES) for i, j in enumerate(ARM)}
     motors['gripper'] = Motor(6, 'sts3215', MotorNormMode.RANGE_0_100)
     cp = pathlib.Path.home() / '.cache/huggingface/lerobot/calibration/robots/so_follower/follower.json'
     cal = {k: MotorCalibration(**v) for k, v in json.loads(cp.read_text()).items()}
-    bus = FeetechMotorsBus(port=port, motors=motors, calibration=cal)
-    try:
-        bus._connect(handshake=False)
-    except AttributeError:
-        bus.connect(handshake=False)
-    bus.write_calibration(cal)
-
     mapping = arm_lib.load_mapping()
+    authority = acquire_device(port, 'probe_floor', offline=True)
+    authority.revalidate()
+    try:
+        bus = FeetechMotorsBus(
+            port=authority.port, motors=motors, calibration=cal)
+    except BaseException:
+        # constructor 단계에는 아직 보존할 bus ref/FD가 없다.
+        authority.release()
+        raise
+    authority.bind_bus(bus)
+    try:
+        connect_bus_once(bus)
+        authority.revalidate()
+    except BaseException as connect_exc:
+        finalize_partial_open(bus, authority, connect_exc)
+        raise
 
-    def goto(z):
+    def goto(z, timeout_s):
         bf = tuple(p + o for p, o in zip((x, y, z), arm_lib.PAN0))
         q = K.ik_best(*bf, pitch=math.radians(-90))
         if q is None:
@@ -89,32 +311,23 @@ def main():
         # rad_to_servo 는 lerobot 액션 키('joint.pos')를 주지만 bus 는 모터명을 받는다
         want = {k.replace('.pos', ''): v
                 for k, v in arm_lib.rad_to_servo(q, mapping).items()}
-        bus.sync_write('Goal_Position', want)
+        write_goal_verified(bus, want)
+        wait_goal_reached(bus, want, timeout_s)
         return True
 
     def load():
         v = bus.sync_read('Present_Load', ARM, normalize=False)
         return sum(abs(int(a)) for a in v.values())
 
-    print(f'접촉 탐지 · x={x:.2f} y={y:.2f} · 스텝 {STEP*1000:.0f}mm '
-          f'· 판정 중앙값±{DEV_MARGIN} 연속 {DEV_HOLD}회 (즉시 {HARD_DEV})\n')
-    bus.disable_torque()
-    for m in list(motors):
-        bus.write('Maximum_Velocity_Limit', m, 254, normalize=False)
-    bus.sync_write('Goal_Velocity', {m: 40 for m in motors}, normalize=False)   # 천천히
-    bus.sync_write('Acceleration', {m: 10 for m in motors}, normalize=False)
-    bus.sync_write('Torque_Limit', {m: 350 for m in motors}, normalize=False)   # 약하게
-    # ★ 켜기 전에 목표를 현재 위치(raw)로 덮는다 — 이전 목표가 남아 있으면 토크가
-    # 들어가는 순간 그리로 튄다 (2026-08-19 교훈, arm_gui._do_torque 와 동일).
-    raw = bus.sync_read('Present_Position', normalize=False)
-    bus.sync_write('Goal_Position', raw, normalize=False)
-    for m in list(motors):
-        bus.enable_torque(m)
-        time.sleep(0.12)
-
     try:
-        goto(Z_START)
-        time.sleep(8.0)                      # 안착 자세에서 오는 첫 이동이 가장 길다
+        print(f'접촉 탐지 · x={x:.2f} y={y:.2f} · 스텝 {STEP*1000:.0f}mm '
+              f'· 판정 중앙값±{DEV_MARGIN} 연속 {DEV_HOLD}회 '
+              f'(즉시 {HARD_DEV})\n')
+        # bus 생성자에 넣은 calibration은 정규화에만 쓴다. 이 측정은 기존
+        # EEPROM calibration을 다시 쓰지 않는다. 이동 전 RAM/토크도 read-back한다.
+        configure_probe_bus(bus, motors, authority.port)
+        if not goto(Z_START, 8.0):
+            raise RuntimeError('시작 자세 IK 실패')
 
         z = Z_START
         hit = None                           # 확정된 접촉 시작점 z
@@ -123,9 +336,8 @@ def main():
         hist = []                            # 최근 부하 (롤링 중앙값용)
         while z > Z_MIN:
             z -= STEP
-            if not goto(z):
+            if not goto(z, 0.55):
                 print(f'z={z:+.3f} IK 해 없음 — 중단'); break
-            time.sleep(0.55)
             lo = load()
             win = sorted(hist[-6:])
             ref = win[len(win) // 2] if win else lo
@@ -156,16 +368,15 @@ def main():
             # "유효"로 승격되는 것이 1차 사고의 2차 피해였다
             print(f'\n⚠ 확정값 {hit:+.4f} 가 기대 밴드 {EXPECT_BAND} 밖 — '
                   f'저장하지 않습니다. 측정 환경을 확인하세요')
-            goto(hit + BACKOFF)
-            time.sleep(2.5)
+            if not goto(hit + BACKOFF, 2.5):
+                raise RuntimeError('기대 밴드 밖 접촉 후퇴 IK 실패')
             rc = 1
         else:
             print(f'\n접촉 시작 z={hit:+.4f}m (확정 z={z:+.4f}) → '
                   f'{BACKOFF*1000:.0f}mm 위로 후퇴')
-            if not goto(hit + BACKOFF):
+            if not goto(hit + BACKOFF, 2.5):
                 raise RuntimeError('후퇴 IK 실패 — 토크 한도를 낮춘 채 종료합니다')
-            time.sleep(2.5)
-            bus.sync_write('Torque_Limit', {m: 600 for m in motors}, normalize=False)
+            sync_write_verified(bus, 'Torque_Limit', {m: 600 for m in motors})
             p = HERE / 'servo_gain.json'
             d = json.loads(p.read_text())
             d['floor_z_m'] = round(hit, 4)
@@ -180,15 +391,11 @@ def main():
             print(f'저장 → floor_z_m = {hit:.4f} (stale 표시 해제)')
             rc = 0
     finally:
-        # 크래시로 나가도 곱게 놓는다 — disconnect 가 토크를 내린다.
+        # 크래시·timeout·Ctrl-C도 authority 해제 전에 hold/OFF를 read-back한다.
         # ★ 여기서 Torque_Limit 을 600 으로 되돌리지 않는다: 눌린 채 죽었을 수
         # 있는데 한도를 올리면 그 순간 더 세게 민다(1차 실행에서 실제로 그랬다).
         # 600 원복은 성공 경로에서 후퇴를 마친 뒤에만 한다.
-        try:
-            bus.disconnect()
-        except Exception:
-            print('⚠ 연결 해제 실패 — 통신 두절. 서보 전원을 껐다 켜세요 '
-                  '(눌림 지속 시 버스가 죽는 패턴, 오늘 2회 재현)')
+        finalize_probe(bus, motors, authority)
     return rc
 
 

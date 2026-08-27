@@ -22,13 +22,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
 import pick_demo as pd
 
-BOX_XY = (0.042, -0.142)     # 통 중심(패널) — 통을 옮기면 여기와 sim XML 갱신
+GEOMETRY = arm_lib.vehicle_geometry()
+BOX_XY = tuple(GEOMETRY['box_xy_m'])
 # 통 교체 (2026-08-20 저녁): 검은 개방형 상자 8×8cm × 높이 6.5cm.
 # 입구 8cm 는 죠(파지폭+손가락 ≈6cm)가 못 들어간다 — **테두리 위에서 방출**.
 # 테두리 = floor + 0.065 = 패널 z -0.013.
-TRANSIT_Z = 0.035            # 운반·복귀 고도 (테두리 +48mm)
-RELEASE_Z = 0.010            # 방출 고도 — 테두리 +23mm (상자 크기 고려,
-                             # 사용자: 더 높은 곳에서 방출. 낙하 ~6.5cm)
+TRANSIT_Z = GEOMETRY['drop_transit_z']
+RELEASE_Z = GEOMETRY['drop_release_z']
 
 K = arm_lib.load_kinematics()
 MP = arm_lib.load_mapping()
@@ -88,18 +88,24 @@ def main():
     print('투하 완료 — 통 위 대기 (토크 유지)')
 
 
-if __name__ == '__main__':
+def run_cli():
     try:
         main()
     except KeyboardInterrupt:
         try:
             pd.post('stop')
-        except Exception:
-            pass
+        except Exception as stop_exc:
+            print(f'비상 정지 요청 실패: {type(stop_exc).__name__}: {stop_exc}',
+                  file=sys.stderr)
         sys.exit('중단(Ctrl-C) — 정지(토크 유지)')
     except Exception:
         try:
             pd.post('stop')
-        except Exception:
-            pass
+        except Exception as stop_exc:
+            print(f'비상 정지 요청 실패: {type(stop_exc).__name__}: {stop_exc}',
+                  file=sys.stderr)
         raise
+
+
+if __name__ == '__main__':
+    run_cli()

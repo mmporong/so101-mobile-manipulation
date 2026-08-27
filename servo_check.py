@@ -20,6 +20,7 @@
 깜빡이면 몇 초 안에 빼야 어댑터가 상하지 않는다.
 """
 import sys
+from owned_bus_session import OwnedBusSession, connect_without_handshake
 
 BAUDS = (1_000_000, 500_000, 250_000, 128_000, 115_200, 57_600, 38_400)
 
@@ -35,35 +36,36 @@ REGS = [
 ]
 
 
+def _connect(bus):
+    connect_without_handshake(bus, prefer_private=True)
+
+
 def scan(port):
-    from lerobot.motors.feetech.feetech import FeetechMotorsBus
-    from lerobot.motors import Motor, MotorNormMode
     for baud in BAUDS:
-        bus = FeetechMotorsBus(
-            port=port, motors={'p': Motor(1, 'sts3215', MotorNormMode.RANGE_0_100)})
-        try:
-            bus._connect(handshake=False)
-        except AttributeError:
-            bus.connect(handshake=False)
-        except Exception:
-            continue
+        session = OwnedBusSession(port, 'servo_check.scan')
+        def make_bus(canonical_port):
+            from lerobot.motors.feetech.feetech import FeetechMotorsBus
+            from lerobot.motors import Motor, MotorNormMode
+            return FeetechMotorsBus(port=canonical_port, motors={
+                'p': Motor(1, 'sts3215', MotorNormMode.RANGE_0_100)})
+        bus = session.open(make_bus, _connect)
         try:
             bus.set_baudrate(baud)
             ids = list(bus.broadcast_ping() or {})
         except Exception:
             ids = []
         finally:
-            try:
-                bus.port_handler.closePort()
-            except Exception:
-                pass
+            session.close()
         if ids:
             return baud, ids
     return None, []
 
 
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else '/dev/ttyACM0'
+    args = [arg for arg in sys.argv[1:] if arg != '--offline']
+    if '--offline' not in sys.argv[1:]:
+        sys.exit('독립 시리얼 진단은 --offline을 명시해야 합니다')
+    port = args[0] if args else '/dev/ttyACM0'
     baud, ids = scan(port)
     if not ids:
         print('서보 응답 없음.\n'
@@ -75,36 +77,34 @@ def main():
     if len(ids) > 1:
         print('  ⚠ 둘 이상입니다 — 진단은 한 개씩 물려서 하세요')
 
-    from lerobot.motors.feetech.feetech import FeetechMotorsBus
-    from lerobot.motors import Motor, MotorNormMode
     for i in ids:
-        bus = FeetechMotorsBus(
-            port=port, motors={'m': Motor(i, 'sts3215', MotorNormMode.RANGE_0_100)})
+        session = OwnedBusSession(port, 'servo_check.read')
+        def make_bus(canonical_port):
+            from lerobot.motors.feetech.feetech import FeetechMotorsBus
+            from lerobot.motors import Motor, MotorNormMode
+            return FeetechMotorsBus(port=canonical_port, motors={
+                'm': Motor(i, 'sts3215', MotorNormMode.RANGE_0_100)})
+        bus = session.open(make_bus, _connect)
         try:
-            bus._connect(handshake=False)
-        except AttributeError:
-            bus.connect(handshake=False)
-        bus.set_baudrate(baud)
-        print(f'\n── ID {i} ──')
-        vals = {}
-        for reg, unit in REGS:
-            try:
-                v = bus.read(reg, 'm', normalize=False)
-                vals[reg] = v
-                shown = f'{v}'
-                if unit == 'V/10':
-                    shown = f'{v}  ({v/10:.1f}V)'
-                elif reg == 'Present_Current':
-                    shown = f'{v}  (≈{v*6.5/1000:.2f}A)'
-                elif unit and unit not in ('V/10',):
-                    shown = f'{v} {unit}'
-                print(f'   {reg:24s} {shown}')
-            except Exception as e:
-                print(f'   {reg:24s} — {type(e).__name__}')
-        try:
-            bus.port_handler.closePort()
-        except Exception:
-            pass
+            bus.set_baudrate(baud)
+            print(f'\n── ID {i} ──')
+            vals = {}
+            for reg, unit in REGS:
+                try:
+                    v = bus.read(reg, 'm', normalize=False)
+                    vals[reg] = v
+                    shown = f'{v}'
+                    if unit == 'V/10':
+                        shown = f'{v}  ({v/10:.1f}V)'
+                    elif reg == 'Present_Current':
+                        shown = f'{v}  (≈{v*6.5/1000:.2f}A)'
+                    elif unit and unit not in ('V/10',):
+                        shown = f'{v} {unit}'
+                    print(f'   {reg:24s} {shown}')
+                except Exception as e:
+                    print(f'   {reg:24s} — {type(e).__name__}')
+        finally:
+            session.close()
 
         # 판정
         lo, hi = vals.get('Min_Position_Limit'), vals.get('Max_Position_Limit')

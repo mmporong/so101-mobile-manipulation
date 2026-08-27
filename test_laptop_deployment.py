@@ -45,15 +45,31 @@ def good_snapshot():
         'seen': ['/odom', '/scan', '/battery_state'],
         'cmd_vel_publishers': [('collision_monitor', '/')],
         'cmd_vel_subscribers': [('jdamr_base_driver', '/')],
+        'base_motion': {'cmd_vel': [0.0, 0.0], 'odom': [0.0, 0.0],
+                        'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1},
     })
 
 
 def test_preflight_policy():
     panel, shape, ros = good_snapshot()
     assert P.evaluate(panel, shape, ros, require_motion_stack=True) == []
+    del ros['base_motion']
+    errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
+    assert any('정지 증거가 없음' in e for e in errors), errors
+    ros['base_motion'] = {'cmd_vel': [0.0, 0.0], 'odom': [0.0, 0.0],
+                          'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1}
     ros['cmd_vel_publishers'].append(('web_teleop', '/'))
     errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
     assert any('하나여야' in e for e in errors), errors
+    ros['cmd_vel_publishers'] = [('collision_monitor', '/')]
+    ros['base_motion']['cmd_vel_age_s'] = 0.6
+    errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
+    assert any('freshness 초과' in e for e in errors), errors
+    ros['base_motion']['cmd_vel_age_s'] = 0.1
+    ros['base_motion']['cmd_vel'] = [0.02, 0.0]
+    errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
+    assert any('속도 상한 초과' in e for e in errors), errors
+    ros['base_motion']['cmd_vel'] = [0.0, 0.0]
     ros['seen'].remove('/scan')
     errors = P.evaluate(panel, shape, ros)
     assert any('/scan' in e for e in errors), errors
@@ -113,10 +129,18 @@ def test_environment_contract():
     assert 'does-not-resolve.invalid' not in output
 
 
+def test_headless_scripts_prime_real_frame():
+    for name in ('run_batch.sh', 'run_demo.sh'):
+        text = (HERE / name).read_text()
+        assert '$API/frame.jpg' in text, name
+        assert 'curl -fSs -m 2' in text, name
+        subprocess.run(['bash', '-n', str(HERE / name)], check=True)
+
+
 def main():
     tests = [test_mjpeg_parser, test_target_lock, test_preflight_policy,
              test_read_only_contract, test_stream_early_end_fails,
-             test_environment_contract]
+             test_environment_contract, test_headless_scripts_prime_real_frame]
     for test in tests:
         test()
         print(f'PASS — {test.__name__}')

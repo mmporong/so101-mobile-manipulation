@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """handeye.py 종단(E2E) 검증 — 실물 없이 전체 파이프라인을 돌린다.
 
-가짜 패널 서버(8865)와 가짜 깊이 데몬(8866, /points 책상 평면)에 정답 변환
+임시 포트의 가짜 패널 서버와 가짜 깊이 데몬(/points 책상 평면)에 정답 변환
 (R_true, t_true)을 심고 6가지 시나리오를 검증한다:
   ① 정상 — 13점 완주, Kabsch+방위평면 교차 일치, 정답 복원
   ② 스톨 — 지점마다 stop, 3연속 실패에서 중단 (2026-08-19 사고 재현 조건)
@@ -27,7 +27,7 @@ import arm_lib
 K = arm_lib.load_kinematics()
 MP = arm_lib.load_mapping()
 J = arm_lib.JOINTS
-PORT, PLANE_PORT = 8865, 8866
+PLANE_PORT = None
 FX, FY, W, H = 550.0, 550.0, 640, 480
 FLOOR = -0.078
 
@@ -44,6 +44,26 @@ _y = np.cross(_f, _x); _y = _y / np.linalg.norm(_y)   # 카메라 y(하)
 R_TRUE = np.column_stack([_x, _y, _f])            # p_rob = R·p_cam + t
 assert abs(np.linalg.det(R_TRUE) - 1) < 1e-9
 RNG = np.random.default_rng(7)
+
+
+class FastTime:
+    """handeye의 timeout/settle 의미를 보존하는 결정적 가상 시계."""
+    now = 0.0
+
+    @classmethod
+    def reset(cls):
+        cls.now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += max(0.0, float(seconds))
+        time.sleep(0)
+
+    strftime = staticmethod(time.strftime)
 
 
 class FakeArm:
@@ -167,11 +187,14 @@ def run_case(arm, torque_kill_at=None):
         Hd.do_POST = do_POST
     else:
         Hd = make_handler(arm)
-    srv = ThreadingHTTPServer(('127.0.0.1', PORT), Hd)
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), Hd)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     import handeye
     import floor_from_depth as ffd
-    handeye.BASE = f'http://127.0.0.1:{PORT}'
+    FastTime.reset()
+    handeye.time = FastTime
+    handeye.BASE = f'http://127.0.0.1:{port}'
     ffd.DAEMON = f'http://127.0.0.1:{PLANE_PORT}'
     case_dir = pathlib.Path(tempfile.mkdtemp())
     handeye.OUT = case_dir / 'handeye.json'
@@ -213,7 +236,8 @@ def check_transform(r, tol_deg=1.5, tol_mm=10.0):
     return ang, dt
 
 
-plane_srv = ThreadingHTTPServer(('127.0.0.1', PLANE_PORT), PlaneDaemon)
+plane_srv = ThreadingHTTPServer(('127.0.0.1', 0), PlaneDaemon)
+PLANE_PORT = plane_srv.server_address[1]
 threading.Thread(target=plane_srv.serve_forever, daemon=True).start()
 
 print('── ① 정상: 13점 완주 · 두 솔버 교차 일치 · 정답 복원 ──')
@@ -273,10 +297,12 @@ print(f'→ OK  깊이 0프레임에서도 회전 {ang:.2f}° · 이동 {dt:.1f}
 
 print('── ⑦ --dry: 이동 없이 관측만 (리허설 모드) ──')
 arm = FakeArm()
-srv = ThreadingHTTPServer(('127.0.0.1', PORT), make_handler(arm))
+srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 import handeye
-handeye.BASE = f'http://127.0.0.1:{PORT}'
+FastTime.reset()
+handeye.time = FastTime
+handeye.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
 sys.argv = ['handeye.py', '--dry']
 code = None
 try:

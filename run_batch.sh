@@ -22,12 +22,22 @@ post_required() {
 # ★ 고아 녹화 정리 (2026-08-26) — 배치가 중간에 죽으면 레코더가 켜진 채 남아
 # 다음 배치의 rec_start 가 "이미 기록 중입니다" 로 전부 거부된다.
 curl -s -m 60 -X POST $API/cmd -H 'Content-Type: application/json' -d '{"op":"rec_cancel"}' >/dev/null 2>&1
-echo "── 0/4 예열 (뎁스 데몬)"
-curl -s -m 20 $API/blob >/dev/null 2>&1
+echo "── 0/4 손목캠 freshness 확인"
+CAMERA_READY=0
 for i in $(seq 1 30); do
-    curl -s -m 3 http://127.0.0.1:8766/health 2>/dev/null | grep -q seq && break
-    sleep 2
+    curl -fSs -m 2 "$API/frame.jpg" -o /dev/null 2>/dev/null || { sleep 0.25; continue; }
+    STATE=$(curl -fSs -m 3 "$API/state" 2>/dev/null) || STATE=
+    if [ -n "$STATE" ] && STATE_JSON="$STATE" "$PY" -c '
+import json, os, sys
+c = (json.loads(os.environ["STATE_JSON"]).get("vision") or {}).get("camera") or {}
+sys.exit(0 if c.get("available") and not c.get("stale") else 1)
+' 2>/dev/null; then CAMERA_READY=1; break; fi
+    sleep 0.25
 done
+if [ "$CAMERA_READY" -ne 1 ]; then
+    echo "⛔ 손목캠 최신 프레임 확인 실패 — 토크를 켜지 않습니다"
+    exit 1
+fi
 post_required "토크 ON" '{"op":"torque","on":true}'
 # 🔒 팬 잠금 — 차량 클램프 장착 상태에서 좌우 회전은 즉시 파손 (2026-08-26)
 post_required "팬 잠금" '{"op":"pan_lock","on":true,"tol":7.0,"center":-15.6}'

@@ -38,6 +38,7 @@ PANEL = 'http://127.0.0.1:8765'
 IDLE_S = 8.0            # 이 시간 동안 프레임 요청이 없으면 절전
 LIVE_HZ = 10.0
 IDLE_HZ = 1.0
+HEARTBEAT_STALE_S = 5.0
 
 
 def _get(url, timeout=2.0):
@@ -52,7 +53,11 @@ class Renderer(threading.Thread):
         self.lock = threading.Lock()
         self.jpeg = None
         self.seq = 0
-        self.beat = time.monotonic()
+        self.beat = 0.0
+        self.panel_error = None
+        self.render_error = None
+        self.last_panel_success = 0.0
+        self.last_render_success = 0.0
         self.last_pull = 0.0          # 마지막 프레임 반출 시각
         self.mode = 'live'            # live | preview | replay
         self.pose = {}
@@ -65,7 +70,8 @@ class Renderer(threading.Thread):
     def set_script(self, frames, fps, mode, hold=0.0):
         with self.lock:
             self._script = {'frames': list(frames), 'fps': max(1.0, float(fps)),
-                            'i': 0, 'hold': float(hold), 'until': None}
+                            'i': 0, 'hold': float(hold), 'until': None,
+                            'next_at': None}
             self.mode = mode
 
     def go_live(self):
@@ -82,14 +88,85 @@ class Renderer(threading.Thread):
             self.piece_yaw = yaw
 
     def take_jpeg(self):
+        now = time.monotonic()
         with self.lock:
             self.last_pull = time.monotonic()
+            if self._status_locked(now)['stale']:
+                return None
             return self.jpeg
+
+    def _status_locked(self, now):
+        beat_age = now - self.beat if self.beat else None
+        panel_age = now - self.last_panel_success if self.last_panel_success else None
+        render_age = now - self.last_render_success if self.last_render_success else None
+        ages = (beat_age, panel_age, render_age)
+        stale = bool(self.panel_error or self.render_error or not self.jpeg
+                     or any(age is None or age < 0 or age > HEARTBEAT_STALE_S
+                            for age in ages))
+        return {
+            'seq': self.seq,
+            'beat_age': round(beat_age, 1) if beat_age is not None else None,
+            'panel_error': self.panel_error,
+            'render_error': self.render_error,
+            'panel_success_age': round(panel_age, 1) if panel_age is not None else None,
+            'render_success_age': round(render_age, 1) if render_age is not None else None,
+            'stale': stale,
+        }
+
+    def status(self):
+        now = time.monotonic()
+        with self.lock:
+            return self._status_locked(now)
+
+    def _pull_panel(self):
+        st = _get(f'{PANEL}/state', timeout=1.0)
+        pose = st.get('pos') or {}
+        with self.lock:
+            self.pose = pose
+            self.panel_error = None
+            self.last_panel_success = time.monotonic()
+        if pose:
+            self.sim.set_pose_deg(pose)
+
+    def _render_frame(self):
+        px = self.sim.render()
+        import PIL.Image
+        buf = io.BytesIO()
+        PIL.Image.fromarray(px).save(buf, 'JPEG', quality=80)
+        now = time.monotonic()
+        with self.lock:
+            self.jpeg = buf.getvalue()
+            self.seq += 1
+            self.beat = now
+            self.last_render_success = now
+            self.render_error = None
+
+    def _update_panel(self):
+        try:
+            self._pull_panel()
+            return True
+        except Exception as e:
+            with self.lock:
+                self.panel_error = f'{type(e).__name__}: {str(e)[:120]}'
+                self.jpeg = None
+            return False
+
+    def _update_render(self):
+        try:
+            self._render_frame()
+            return True
+        except Exception as e:
+            with self.lock:
+                self.render_error = f'{type(e).__name__}: {str(e)[:120]}'
+                self.jpeg = None
+            return False
 
     # ---- 루프 ----------------------------------------------------------
     def run(self):
         while not self.closing:
             t0 = time.monotonic()
+            with self.lock:
+                self.beat = t0
             idle = (t0 - self.last_pull) > IDLE_S
             hz = IDLE_HZ if idle else LIVE_HZ
             try:
@@ -97,48 +174,46 @@ class Renderer(threading.Thread):
                     script = self._script
                     mode = self.mode
                 if script is not None:
+                    hz = max(hz, script['fps'])
                     self._step_script(script)
                 else:
-                    st = _get(f'{PANEL}/state', timeout=1.0)
-                    self.pose = st.get('pos') or {}
-                    if self.pose:
-                        self.sim.set_pose_deg(self.pose)
-            except Exception:
-                pass                        # 패널 순단 — 마지막 자세를 계속 그린다
+                    if not self._update_panel():
+                        time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - t0)))
+                        continue
+            except Exception as e:
+                with self.lock:
+                    self.panel_error = f'{type(e).__name__}: {str(e)[:120]}'
+                # 패널 순단에는 마지막 자세를 보존하되 stale/error를 공개한다.
             # 절전은 '정지'가 아니라 '저속'(1Hz)이다 — 아예 멈추면 다시 열었을
             # 때 낡은 자세가 한 번 스치고, 그 프레임이 실물과 다르면 오해를
             # 만든다. 렌더율은 위 hz 가 정한다.
-            try:
-                px = self.sim.render()
-                import PIL.Image
-                buf = io.BytesIO()
-                PIL.Image.fromarray(px).save(buf, 'JPEG', quality=80)
-                with self.lock:
-                    self.jpeg = buf.getvalue()
-                    self.seq += 1
-            except Exception:
-                pass
-            self.beat = time.monotonic()
+            self._update_render()
             time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - t0)))
 
-    def _step_script(self, script):
+    def _step_script(self, script, now=None):
         """프리뷰/재생 한 스텝 — 끝나면 라이브로 되돌아간다."""
+        now = time.monotonic() if now is None else float(now)
         frames = script['frames']
         i = script['i']
         if i >= len(frames):
             if script['hold'] > 0:
                 if script['until'] is None:
-                    script['until'] = time.monotonic() + script['hold']
-                if time.monotonic() < script['until']:
+                    script['until'] = now + script['hold']
+                if now < script['until']:
                     return
             self.go_live()
+            return
+        if script['next_at'] is not None and now < script['next_at']:
             return
         deg = frames[i]
         # 프리뷰·재생은 부착 로직을 끈다 — 기록된 그리퍼 값이 만든 가짜 전이가
         # 물체를 죠에 붙여 버리면 재생 화면이 실제 에피소드와 달라진다.
-        self.sim.set_pose_deg(deg, attach=(self.mode == 'replay'))
-        self.pose = dict(deg)
+        self.sim.set_pose_deg(deg, attach=False)
+        with self.lock:
+            self.pose = dict(deg)
+            self.last_panel_success = now
         script['i'] = i + 1
+        script['next_at'] = now + 1.0 / script['fps']
 
 
 def make_handler(rd):
@@ -159,11 +234,13 @@ def make_handler(rd):
             return json.loads(self.rfile.read(n) or b'{}')
 
         def do_GET(self):
-            age = round(time.monotonic() - rd.beat, 1)
+            status = rd.status()
             if self.path == '/health':
-                self._json({'seq': rd.seq, 'beat_age': age, 'mode': rd.mode,
-                            'holding': rd.sim.holding})
+                self._json({**status, 'mode': rd.mode, 'holding': rd.sim.holding})
             elif self.path.startswith('/frame.jpg'):
+                if status['stale']:
+                    return self._json({'error': '미러 프레임 stale',
+                                       'status': status}, 503)
                 j = rd.take_jpeg()
                 if not j:
                     return self._json({'error': '프레임 없음'}, 503)
@@ -174,7 +251,7 @@ def make_handler(rd):
                 self.end_headers()
                 self.wfile.write(j)
             elif self.path == '/state':
-                self._json({'seq': rd.seq, 'beat_age': age, 'mode': rd.mode,
+                self._json({**status, 'mode': rd.mode,
                             'holding': rd.sim.holding, 'pose': rd.pose,
                             'piece_xy': rd.piece_xy,
                             'piece_yaw': (round(rd.piece_yaw, 1)

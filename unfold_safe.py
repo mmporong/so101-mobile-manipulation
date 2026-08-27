@@ -7,6 +7,7 @@
   · 위치 정체만 감시했다 → 예측 z 와 실측 z 의 괴리(부분 걸림)도 함께 본다
 """
 import json
+import math
 import pathlib
 import sys
 import urllib.request
@@ -15,8 +16,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
 
 BASE = 'http://127.0.0.1:8765'
-K = arm_lib.load_kinematics()
-MP = arm_lib.load_mapping()
+K = None
+MP = None
 J = arm_lib.JOINTS
 
 STEP = 8.0            # 한 걸음 [°]
@@ -28,10 +29,54 @@ SHOULDER_LIFT_SPEED_DPS = 6.0
 NORMAL_SPEED_DPS = 13.0
 CAUTIOUS_SPEED_DPS = 9.0
 
-CAL = json.loads(pathlib.Path('~/.cache/huggingface/lerobot/calibration/robots/'
-                              'so_follower/follower.json').expanduser().read_text())
-BOUNDS = {j: (b[0] + 2.0, b[1] - 2.0)
-          for j, b in arm_lib.calib_bounds(CAL).items() if j in J}
+DEFAULT_CALIBRATION_PATH = pathlib.Path(
+    '~/.cache/huggingface/lerobot/calibration/robots/'
+    'so_follower/follower.json').expanduser()
+
+
+def _validated_bounds(bounds):
+    if not isinstance(bounds, dict) or set(J) - set(bounds):
+        missing = sorted(set(J) - set(bounds or {})) if isinstance(bounds, dict) else J
+        raise RuntimeError(f'캘리브레이션 관절 경계 누락: {missing}')
+    validated = {}
+    for joint in J:
+        limit = bounds[joint]
+        if not isinstance(limit, (list, tuple)) or len(limit) != 2:
+            raise RuntimeError(f'{joint} 캘리브레이션 경계가 유효하지 않습니다')
+        lo, hi = limit
+        if (type(lo) not in (int, float) or type(hi) not in (int, float)
+                or not math.isfinite(lo) or not math.isfinite(hi) or lo >= hi):
+            raise RuntimeError(f'{joint} 캘리브레이션 경계가 유효하지 않습니다')
+        validated[joint] = (float(lo), float(hi))
+    return validated
+
+
+def load_calibration_bounds(path=DEFAULT_CALIBRATION_PATH):
+    """운영 시점에만 calibration을 읽고 2° 안전 여유를 적용한다."""
+    try:
+        calibration = json.loads(pathlib.Path(path).read_text())
+        raw = arm_lib.calib_bounds(calibration)
+        bounds = {joint: (raw[joint][0] + 2.0, raw[joint][1] - 2.0)
+                  for joint in J}
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError(f'캘리브레이션 경계를 읽을 수 없습니다: {e}') from e
+    return _validated_bounds(bounds)
+
+
+def _runtime_kinematics():
+    global K, MP
+    if K is None:
+        K = arm_lib.load_kinematics()
+    if MP is None:
+        MP = arm_lib.load_mapping()
+    return K, MP
+
+
+def segment_speed(joint, requested_dps):
+    """shoulder_lift가 포함된 모든 구간을 6°/s 이하로 제한한다."""
+    requested_dps = float(requested_dps)
+    return min(requested_dps, SHOULDER_LIFT_SPEED_DPS) \
+        if joint == 'shoulder_lift' else requested_dps
 
 
 def post(op, **kw):
@@ -61,8 +106,9 @@ def bail(msg):
 
 
 def fk_z(pos):
-    q = arm_lib.servo_to_rad({f'{j}.pos': pos[j] for j in J}, MP)
-    return K.fk_pos(q)[2] - arm_lib.PAN0[2]
+    kinematics, mapping = _runtime_kinematics()
+    q = arm_lib.servo_to_rad({f'{j}.pos': pos[j] for j in J}, mapping)
+    return kinematics.fk_pos(q)[2] - arm_lib.PAN0[2]
 
 
 def predict_z(pos, joint, delta):
@@ -87,12 +133,14 @@ def path_min_z(pos, joint, target, n=24):
     return lo
 
 
-def plan_waypoints(st):
+def plan_waypoints(st, bounds=None):
     """현재 자세에서 작업 자세까지 이어지는 웨이포인트와 구간 속도를 만든다.
 
     STEP은 저공 구간의 안전 경로를 찾는 계산 간격일 뿐 실행 단위가 아니다.
     반환된 웨이포인트 전체를 smooth_move가 한 번의 15Hz 궤적으로 보간한다.
     """
+    bounds = (load_calibration_bounds() if bounds is None
+              else _validated_bounds(bounds))
     work = dict(WORK)
     if st.get('pan_lock') is not None:
         work['shoulder_pan'] = float(st['pan_lock'])
@@ -109,7 +157,7 @@ def plan_waypoints(st):
         for j in J:
             for d in (+STEP, -STEP):
                 t = pos[j] + d
-                if not (BOUNDS[j][0] <= t <= BOUNDS[j][1]):
+                if not (bounds[j][0] <= t <= bounds[j][1]):
                     continue
                 gain = predict_z(pos, j, d) - z
                 if best is None or gain > best[3]:
@@ -120,7 +168,7 @@ def plan_waypoints(st):
         pos = {**pos, j: t}
         z += gain
         waypoints.append(dict(pos))
-        speeds.append(CLEAR_SPEED_DPS)
+        speeds.append(segment_speed(j, CLEAR_SPEED_DPS))
         joints.append(j)
     if z < Z_CLEAR:
         raise RuntimeError(f'죠 부양 경로가 z={z:+.4f}에서 끝났습니다')
@@ -135,8 +183,7 @@ def plan_waypoints(st):
         if zmin >= -0.02:
             pos = {**pos, j: work[j]}
             waypoints.append(dict(pos))
-            speeds.append(SHOULDER_LIFT_SPEED_DPS if j == 'shoulder_lift'
-                          else NORMAL_SPEED_DPS)
+            speeds.append(segment_speed(j, NORMAL_SPEED_DPS))
             joints.append(j)
         else:
             while abs(pos[j] - work[j]) > 1.5:
@@ -148,19 +195,19 @@ def plan_waypoints(st):
                         f'{j} 다음 경로가 z={zp:+.4f}로 내려갑니다')
                 pos = {**pos, j: t}
                 waypoints.append(dict(pos))
-                speeds.append(CAUTIOUS_SPEED_DPS)
+                speeds.append(segment_speed(j, CAUTIOUS_SPEED_DPS))
                 joints.append(j)
         z = fk_z(pos)
 
     return z0, work, waypoints, speeds, joints
 
 
-def main():
+def main(bounds=None):
     st = state()
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 상태가 아닙니다')
     try:
-        z0, work, waypoints, speeds, joints = plan_waypoints(st)
+        z0, work, waypoints, speeds, joints = plan_waypoints(st, bounds=bounds)
     except RuntimeError as e:
         bail(str(e))
     print(f'시작 z={z0:+.4f}m · 자세 '

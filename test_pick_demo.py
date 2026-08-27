@@ -14,6 +14,7 @@ import math
 import pathlib
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer
 
 import numpy as np
@@ -43,6 +44,19 @@ def _load_gain(key):
 arm_lib.load_gain = _load_gain
 FX = FY = 577.31
 W, H = 640, 480
+
+
+class FastTime:
+    """제품의 시간 경계는 유지하고 실물 대기만 가상 시간으로 치환한다."""
+    now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += max(0.0, float(seconds))
 
 
 def to_px(p_rob):
@@ -76,13 +90,22 @@ def run_case(name, blob, expect_exit=None, expect_sub='', pose='lying'):
     srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
-    old, sys.argv = sys.argv, ['pick_demo.py', pose]
+    old, sys.argv = sys.argv, ['pick_demo.py', pose, '--legacy-bench']
+    old_pd_time = pd.time
+    old_sleep = time.sleep
+    FastTime.now = 0.0
+    pd.time = FastTime
+    # grip_close_ramp()가 함수 안에서 표준 time을 다시 import한다. 네트워크
+    # 요청 순서는 그대로 두고 그 램프의 벽시계 대기만 제거한다.
+    time.sleep = lambda _seconds: old_sleep(0)
     code = None
     try:
         pd.main()
     except SystemExit as e:
         code = e.code
     finally:
+        pd.time = old_pd_time
+        time.sleep = old_sleep
         sys.argv = old
         srv.shutdown()
         srv.server_close()
@@ -151,13 +174,20 @@ def main():
     srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
-    old_argv, sys.argv = sys.argv, ['pick_demo.py', 'cube']
+    old_argv, sys.argv = sys.argv, ['pick_demo.py', 'cube', '--legacy-bench']
+    old_pd_time = pd.time
+    old_sleep = time.sleep
+    FastTime.now = 0.0
+    pd.time = FastTime
+    time.sleep = lambda _seconds: old_sleep(0)
     code = None
     try:
         pd.main()
     except SystemExit as e:
         code = e.code
     finally:
+        pd.time = old_pd_time
+        time.sleep = old_sleep
         sys.argv = old_argv
         srv.shutdown(); srv.server_close()
     assert code and '깊이 표본 부족' in str(code), f'강등 금지 미동작: {code}'

@@ -28,6 +28,23 @@ J = arm_lib.JOINTS
 FLOOR = arm_lib.load_gain('floor_z_m')['floor_z_m']
 
 
+class FastTime:
+    """timeout 판정은 유지하고 모의 팔의 물리 대기만 가상화한다."""
+    now = 0.0
+
+    @classmethod
+    def reset(cls):
+        cls.now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += max(0.0, float(seconds))
+
+
 class FakeArm:
     def __init__(self, tcp, gripper, ignore_gripper=False, halt_after=0,
                  settle_gap=0.0):
@@ -119,12 +136,16 @@ def run_case(name, tcp, gripper, argv, expect_exit=None, expect_sub='',
     th.start()
     pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
     old_argv, sys.argv = sys.argv, ['place_down.py'] + argv
+    old_pd_time, old_place_time = pd.time, place_down.time
+    FastTime.reset()
+    pd.time = place_down.time = FastTime
     code = None
     try:
         place_down.main()
     except SystemExit as e:
         code = e.code
     finally:
+        pd.time, place_down.time = old_pd_time, old_place_time
         sys.argv = old_argv
         srv.shutdown()
         srv.server_close()
@@ -174,7 +195,8 @@ def main():
     assert not arm.ops, f'--dry 인데 op 발행: {arm.ops}'
 
     print('⑤ 저고도 가드 — TCP 가 놓기 높이보다 낮음')
-    arm = run_case('저고도', (0.19, 0.02, -0.075), 2.5, [],
+    low_z = FLOOR + pd.POSE['lying'][1] + place_down.PLACE_MARGIN - 0.004
+    arm = run_case('저고도', (0.19, 0.02, low_z), 2.5, [],
                    expect_exit=True, expect_sub='낮음')
     assert not [o for o, _ in arm.ops if o in ('ik', 'goto')], '이동이 발행됨!'
 

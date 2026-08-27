@@ -24,6 +24,7 @@ USB 는 보드 로직만 켜고, 서보는 별도 전원(7.4V/12V)을 받아야 
 띄워 두고 꽂으면 바로 보여요.
 """
 import sys
+from owned_bus_session import OwnedBusSession, connect_without_handshake
 
 # 피텍이 쓰는 속도들. 공장 기본이 1,000,000 이지만 손댄 서보가 섞이면 달라질 수 있어
 # 전부 훑는다.
@@ -31,30 +32,33 @@ BAUDS = (1_000_000, 500_000, 250_000, 128_000, 115_200, 57_600, 38_400)
 
 
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else '/dev/ttyACM0'
-    from lerobot.motors.feetech import FeetechMotorsBus
-
-    bus = FeetechMotorsBus(port=port, motors={})
+    args = [arg for arg in sys.argv[1:] if arg != '--offline']
+    if '--offline' not in sys.argv[1:]:
+        sys.exit('독립 시리얼 탐색은 --offline을 명시해야 합니다')
+    port = args[0] if args else '/dev/ttyACM0'
+    session = OwnedBusSession(port, 'scan_motors')
+    def make_bus(canonical_port):
+        from lerobot.motors.feetech import FeetechMotorsBus
+        return FeetechMotorsBus(port=canonical_port, motors={})
+    bus = session.open(
+        make_bus, connect_without_handshake)
     try:
-        bus.connect(handshake=False)
-    except TypeError:                      # 구버전은 인자가 없다
-        bus.connect()
-    print(f'포트 {port} 연결됨')
-
-    hit = {}
-    for baud in BAUDS:
-        try:
-            bus.set_baudrate(baud)
-            found = bus.broadcast_ping()
-        except Exception as e:
-            print(f'  {baud:>9} bps · 오류 {type(e).__name__}')
-            continue
-        if found:
-            hit[baud] = found
-            print(f'  {baud:>9} bps · ★ {len(found)}개 → {found}')
-        else:
-            print(f'  {baud:>9} bps · 없음')
-    bus.disconnect()
+        print(f'포트 {port} 연결됨')
+        hit = {}
+        for baud in BAUDS:
+            try:
+                bus.set_baudrate(baud)
+                found = bus.broadcast_ping()
+            except Exception as e:
+                print(f'  {baud:>9} bps · 오류 {type(e).__name__}')
+                continue
+            if found:
+                hit[baud] = found
+                print(f'  {baud:>9} bps · ★ {len(found)}개 → {found}')
+            else:
+                print(f'  {baud:>9} bps · 없음')
+    finally:
+        session.close()
 
     print()
     if not hit:

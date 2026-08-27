@@ -16,12 +16,15 @@ import json
 import pathlib
 import sys
 import time
+import argparse
 
 import numpy as np
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import pick_demo as pd                             # noqa: E402
+from owned_bus_session import (                    # noqa: E402
+    OwnedBusSession, connect_without_handshake)
 
 J = ['shoulder_pan', 'shoulder_lift', 'elbow_flex',
      'wrist_flex', 'wrist_roll', 'gripper']
@@ -30,28 +33,44 @@ CAL = pathlib.Path('~/.cache/huggingface/lerobot/calibration/'
 
 
 def main():
-    st = pd.get('/state')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', default='/dev/ttyACM0')
+    parser.add_argument('--offline', action='store_true')
+    args = parser.parse_args()
+    if not args.offline:
+        parser.error('독립 시리얼 유지보수는 --offline을 명시해야 합니다')
+    session = OwnedBusSession(args.port, 'calib_leader_match').acquire()
+    try:
+        st = pd.get('/state')
+    except BaseException:
+        session.close()
+        raise
     if not st['connected']:
+        session.close()
         sys.exit('패널 미연결')
     Pf = {j: float(st['pos'][j]) for j in J}
     print('팔로워 기준 자세:', {j: round(v, 1) for j, v in Pf.items()})
 
-    from lerobot.motors.feetech import FeetechMotorsBus
-    from lerobot.motors import Motor, MotorNormMode
-    bus = FeetechMotorsBus(port='/dev/ttyACM0', motors={
-        j: Motor(i + 1, 'sts3215', MotorNormMode.RANGE_M100_100)
-        for i, j in enumerate(J)})
-    bus.connect(handshake=False)
+    def make_bus(canonical_port):
+        from lerobot.motors.feetech import FeetechMotorsBus
+        from lerobot.motors import Motor, MotorNormMode
+        return FeetechMotorsBus(port=canonical_port, motors={
+            j: Motor(i + 1, 'sts3215', MotorNormMode.RANGE_M100_100)
+            for i, j in enumerate(J)})
+    bus = session.open(
+        make_bus, connect_without_handshake)
 
-    print('\n★ 리더를 팔로워와 똑같은 자세로 잡고 유지하세요 — 8초 뒤 판독')
-    for k in range(8, 0, -1):
-        print(f'  {k}...')
-        time.sleep(1.0)
-    reads = []
-    for _ in range(10):
-        reads.append(bus.sync_read('Present_Position', normalize=False))
-        time.sleep(0.1)
-    bus.disconnect(disable_torque=False)
+    try:
+        print('\n★ 리더를 팔로워와 똑같은 자세로 잡고 유지하세요 — 8초 뒤 판독')
+        for k in range(8, 0, -1):
+            print(f'  {k}...')
+            time.sleep(1.0)
+        reads = []
+        for _ in range(10):
+            reads.append(bus.sync_read('Present_Position', normalize=False))
+            time.sleep(0.1)
+    finally:
+        session.close()
     raw = {j: float(np.median([r[j] for r in reads])) for j in J}
     jitter = {j: float(np.ptp([r[j] for r in reads])) for j in J}
     print('리더 원시값:', {j: round(v) for j, v in raw.items()})

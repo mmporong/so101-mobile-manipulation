@@ -2,10 +2,9 @@
 # SO-101 픽앤플레이스 데모 일괄 실행 (2026-08-20)
 #
 #   휴지(접힘) → 펴기 → 파지 → 운반 → 통 투하 → 휴지(접힘·그리퍼 다묾)
-#   + 녹화 3종: 손목캠 · 뎁스캠 정면 · MuJoCo 미러
+#   + 녹화: 손목캠 · MuJoCo 미러 · 화면
 #
-# 전제: 패널 서버(8765)·뎁스 데몬(8766) 가동, 팔은 휴지 자세(토크 무관),
-#       빨간 체스말이 픽업 존에 놓여 있을 것 (뎁스캠 검출을 스스로 확인한다)
+# 전제: 패널 서버(8765)와 손목캠 가동, 팔은 휴지 자세(토크 무관)
 # 사용: bash ~/so101-mobile-manipulation/run_demo.sh
 # 중단: Ctrl-C → 팔 정지(토크 유지) 후 녹화 마감까지 하고 종료
 set -u
@@ -14,6 +13,7 @@ POSE="${1:-cube}"            # cube(기본, 4×4cm 빨간 큐브) | lying | stan
 # 정합(handeye.json)은 카메라를 옮기면 무효라, 캠이 움직일 수 있는 구성에서는
 # 폐루프가 기본이다 (2026-08-21).
 PICK="${PICK:-wrist}"
+[ "$PICK" = "wrist" ] || { echo "차량 프로필은 wrist 파지만 지원합니다"; exit 2; }
 TOOLS="$HOME/so101-mobile-manipulation"
 OUT="$TOOLS/media/$(date +%Y-%m-%d)"
 TS="$(date +%H%M%S)"
@@ -34,7 +34,7 @@ say() { echo; echo "══ $*"; }
 # 끄려면 DEMO_NO_REC=1.
 REC_ID="so101_${POSE}"
 rec_start() {
-    [ -n "${DEMO_NO_REC:-}" ] && { echo "데이터셋 기록 생략 (DEMO_NO_REC)"; return 0; }
+    [ "${DEMO_NO_REC:-0}" = "1" ] && { echo "데이터셋 기록 생략 (DEMO_NO_REC=1)"; return 0; }
     local task
     case "$POSE" in
         cube) task="pick the red cube and drop it in the box" ;;
@@ -56,11 +56,13 @@ rec_start() {
             -d "{\"op\":\"rec_start\",\"repo_id\":\"$REC_ID\",\"task\":\"$task\",\"fps\":10}")
         echo "데이터셋 기록(재시도): $r"
     fi
-    echo "$r" | grep -q '"ok": *true' \
-        || echo "⚠ 기록 시작 실패 — 이 시행은 데이터셋에 안 남습니다"
+    if ! echo "$r" | grep -q '"ok": *true'; then
+        echo "⛔ 기록 시작 실패 — DEMO_NO_REC=1이 아니므로 데모를 중단합니다"
+        return 1
+    fi
 }
 rec_stop() {
-    [ -n "${DEMO_NO_REC:-}" ] && return 0
+    [ "${DEMO_NO_REC:-0}" = "1" ] && return 0
     local r
     r=$(curl -s -m 90 -X POST "$API/cmd" -H 'Content-Type: application/json' \
         -d '{"op":"rec_stop"}')
@@ -121,32 +123,24 @@ echo "$st" | grep -q '"connected": true' || {
     curl -s -m 5 "$API/state" | grep -q '"connected": true' \
         || { echo "연결 실패 — 전원·USB 확인"; exit 1; }
 }
-say "물체 검증 ($PICK)"
-if [ "$PICK" = "wrist" ]; then
-    # ★ 손목캠으로 점검하면 안 된다 — 손목캠은 팔이 보는 곳만 보고, 점검 시점의
-    # 자세(접힘·이전 실패 자리)와 실제 파지 시점의 자세(펴기 이후)가 다르다.
-    # 뎁스캠은 고정이라 팔 자세와 무관하게 작업대를 본다 (2026-08-21).
-    if ! curl -s -m 8 "$API/blob" | grep -q '"u":'; then
-        echo "→ 뎁스캠이 빨간 물체를 못 봅니다 — 작업대 위에 놓고 다시 실행하세요"
-        exit 1
+say "손목캠 freshness 검증"
+FRAME_READY=0
+for _ in $(seq 1 20); do
+    if curl -fSs -m 2 "$API/frame.jpg" -o /dev/null 2>/dev/null; then
+        FRAME_READY=1; break
     fi
-    echo "뎁스캠 검출 OK (손목캠 정렬은 펴기 이후 파지 단계에서 합니다)"
-else
-    if ! timeout 60 "$PY" "$TOOLS/pick_demo.py" "$POSE" --dry; then
-        echo "→ 물체를 팔이 닿는 자리에 놓고 다시 실행하세요"
-        exit 1
-    fi
-fi
-echo "연결·물체 검증 OK"
+    sleep 0.25
+done
+[ "$FRAME_READY" -eq 1 ] || { echo "손목캠 실제 프레임 확인 실패"; exit 1; }
+st=$(curl -s -m 5 "$API/state") || { echo "패널 상태 재확인 실패"; exit 1; }
+echo "$st" | "$PY" -c 'import json,sys; c=(json.load(sys.stdin).get("vision") or {}).get("camera") or {}; sys.exit(0 if c.get("available") and not c.get("stale") else 1)' \
+    || { echo "손목캠 최신 프레임 없음 — 케이블·패널 상태를 확인하세요"; exit 1; }
+echo "연결·손목캠 검증 OK"
 
-say "녹화 시작 — 손목캠·정면RGB·뎁스·화면(웹패널+뮤조코)·시뮬렌더·관절각CSV"
+say "녹화 시작 — 손목캠·화면(웹패널+뮤조코)·시뮬렌더·관절각CSV"
 FR="-movflags +frag_keyframe+empty_moov"      # 중단돼도 mp4 유효
 ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/cam" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_wrist.mp4" & PIDS+=($!)
-ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/rgb" -t 900 \
-       -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_rgb.mp4" & PIDS+=($!)
-ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/depth" -t 900 \
-       -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_depth.mp4" & PIDS+=($!)
 DISP="${DISPLAY:-:1}"
 SIZE=$(xdpyinfo -display "$DISP" 2>/dev/null | awk '/dimensions/{print $2}')
 if [ -n "$SIZE" ]; then
@@ -170,16 +164,11 @@ run_stage() {
     if ! "$@"; then fail="$name"; return 1; fi
 }
 
-# 파지 명령을 미리 정해 둔다 — &&/|| 사슬 안에서 분기하면 실패가 성공으로 삼켜진다
-if [ "$PICK" = "wrist" ]; then
-    PICK_NAME="파지 (손목캠 폐루프)"
-    PICK_CMD=("$PY" "$TOOLS/pick_wrist.py")
-else
-    PICK_NAME="파지 (pick_demo $POSE)"
-    PICK_CMD=("$PY" "$TOOLS/pick_demo.py" "$POSE")
-fi
+# 차량 프로필은 검증된 손목캠 폐루프만 실행한다.
+PICK_NAME="파지 (손목캠 폐루프)"
+PICK_CMD=("$PY" "$TOOLS/pick_wrist.py")
 
-rec_start
+rec_start || exit 1
 run_stage "토크 ON" curl -sf -m 15 -X POST "$API/cmd" \
     -H 'Content-Type: application/json' -d '{"op":"torque","on":true}' -o /dev/null \
 && sleep 2 \

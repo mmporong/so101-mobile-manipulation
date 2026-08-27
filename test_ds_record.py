@@ -6,7 +6,7 @@ py_compile 로는 부족하다: LeRobotDataset 은 feature 규격·프레임 dty
 
 검사:
   ① 에피소드 저장 → info.json·parquet 생성, 프레임 수 일치
-  ② action = 명령 목표(note_action), 상태와 독립인지
+  ② action = 완료된 Worker applied_action이며 요청값·거부값은 폐기되는지
   ③ 이미지 피처가 규격대로 들어가는지
   ④ 상태가 안 바뀌면 dup_pct 가 그것을 드러내는지 (정지 데이터 경보)
   ⑤ 연결·캘리브 전에는 기록이 시작되지 않는지 (fail-closed)
@@ -50,6 +50,8 @@ class FakeCam:
     def __init__(self, w=352, h=288):
         import cv2
         self.cv2, self.w, self.h, self.k = cv2, w, h, 0
+        self.sequence = 0
+        self.captured_at = None
 
     def ensure(self):
         pass
@@ -58,7 +60,14 @@ class FakeCam:
         self.k = (self.k + 7) % 200
         img = np.full((self.h, self.w, 3), self.k, np.uint8)
         ok, buf = self.cv2.imencode('.jpg', img)
+        self.sequence += 1
+        self.captured_at = time.monotonic()
         return buf.tobytes() if ok else None
+
+    def snapshot_frame(self):
+        jpeg = self.snapshot_jpeg()
+        return {'jpeg': jpeg, 'sequence': self.sequence,
+                'captured_at': self.captured_at, 'age': 0.0, 'stale': False}
 
 
 def main():
@@ -76,14 +85,20 @@ def main():
         print('  가드: OK')
 
         print('① 에피소드 기록·저장')
-        r = rec.start_episode('so101_test', '큐브 집기', fps=10, root=root,
+        r = rec.start_episode('so101_test', '큐브 집기', fps=30, root=root,
                               wrist=True, depth=False)
         assert r['ok'], f'시작 실패: {r}'
         assert r['cameras'] == ['wrist'], f'카메라 구성 이상: {r}'
-        rec.note_action({j: 42.0 for j in J})          # ② 명령 목표
-        for _ in range(12):
+        time.sleep(0.15)
+        assert rec.status()['frames'] == 0, '첫 completed action 전 프레임이 기록됨'
+        assert rec.note_action({j: 99.0 for j in J}) is False
+        assert rec.note_command({'status': 'rejected',
+                                 'applied_action': {j: 88.0 for j in J}}) is False
+        assert rec.note_command({'status': 'completed',
+                                 'applied_action': {j: 42.0 for j in J}}) is True
+        for _ in range(8):
             wk.move(0.5)                                # 상태는 계속 변한다
-            time.sleep(0.1)
+            time.sleep(0.04)
         st = rec.status()
         assert st['recording'] and st['frames'] >= 6, f'프레임 부족: {st}'
         got = rec.stop_episode(save=True)
@@ -101,29 +116,29 @@ def main():
         feats = set(ds.features)
         for want in ('observation.state', 'action', 'observation.images.wrist'):
             assert want in feats, f'피처 누락: {want} (있는 것: {sorted(feats)})'
-        # 마지막 프레임을 본다 — 명령(note_action) 이전에 잡힌 첫 프레임은
-        # 설계상 action=현재자세(zero-order hold 의 초기값)라 검사 대상이 아니다
         item = ds[ds.num_frames - 1]
         act = np.asarray(item['action']).reshape(-1)
         state = np.asarray(item['observation.state']).reshape(-1)
         assert np.allclose(act, 42.0, atol=1e-3), f'action 이 명령 목표가 아님: {act}'
         assert not np.allclose(state, 42.0), f'state 가 action 을 따라감: {state}'
         first = np.asarray(ds[0]['action']).reshape(-1)
-        assert np.allclose(first, 10.0, atol=1e-3), \
-            f'명령 전 프레임의 action 이 현재자세가 아님: {first}'
+        assert np.allclose(first, 42.0, atol=1e-3), \
+            f'첫 프레임이 completed applied_action이 아님: {first}'
         img = np.asarray(item['observation.images.wrist'])
         assert img.ndim == 3 and 3 in img.shape, f'이미지 형상 이상: {img.shape}'
         print(f'  action={act[:2]}… · state={state[:2]}… · 이미지 {img.shape}: OK')
 
         print('④ 정지 데이터 경보 (dup_pct)')
-        r = rec.start_episode('so101_still', '정지', fps=10, root=root,
+        r = rec.start_episode('so101_still', '정지', fps=30, root=root,
                               wrist=False, depth=False)
         assert r['ok'], f'시작 실패: {r}'
-        time.sleep(1.2)                                  # 상태를 안 움직인다
+        assert rec.note_command({'status': 'completed',
+                                 'applied_action': {j: 10.0 for j in J}})
+        time.sleep(0.3)                                  # 상태를 안 움직인다
         st = rec.status()
         rec.stop_episode(save=False)
         assert st['frames'] >= 4, f'프레임 부족: {st}'
-        assert st['dup_pct'] > 80, f'정지인데 dup_pct={st["dup_pct"]} — 경보 미동작'
+        assert st['dup_pct'] >= 80, f'정지인데 dup_pct={st["dup_pct"]} — 경보 미동작'
         print(f"  dup_pct={st['dup_pct']}% — 정지 데이터가 드러남: OK")
 
         print('\n통과 — ds_record 리허설 5항목')

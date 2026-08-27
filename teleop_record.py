@@ -31,12 +31,61 @@ HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import arm_lib                                     # noqa: E402
 import pick_demo as pd                             # noqa: E402
+from owned_bus_session import OwnedBusSession      # noqa: E402
 
 JOINTS6 = ['shoulder_pan', 'shoulder_lift', 'elbow_flex',
            'wrist_flex', 'wrist_roll', 'gripper']
 STEP_DEG = 80.0   # 글리치 가드 — 틱 주기가 떨어져도 속도가 죽지 않게
 FLOOR_MARGIN = 0.002
 TASK = 'pick the red cube and place it on the table'   # 스크립트 수집분과 동일
+
+
+class LeaderSession:
+    """리더 시리얼 버스와 장치 권위를 같은 수명으로 묶는다."""
+
+    def __init__(self, port):
+        self.port = port
+        self.authority = None
+        self.leader = None
+        self._owned_session = None
+
+    def connect(self):
+        from hardware_authority import acquire_runtime_device
+
+        def acquire(port, owner, offline=False):
+            return acquire_runtime_device(port, owner)
+
+        owned = OwnedBusSession(
+            self.port, 'teleop_record.SO101Leader',
+            authority_factory=acquire)
+        self._owned_session = owned
+        owned.acquire()
+        self.authority = owned.authority
+
+        def make_leader(canonical_port):
+            from lerobot.teleoperators.so_leader import (
+                SO101Leader, SO101LeaderConfig)
+            self.leader = SO101Leader(SO101LeaderConfig(
+                port=canonical_port, use_degrees=True, id='leader'))
+            return self.leader
+
+        try:
+            owned.open(make_leader, lambda leader: leader.connect(calibrate=False))
+        except BaseException:
+            if owned.state == 'closed':
+                self.leader = None
+                self.authority = None
+                self._owned_session = None
+            raise
+        return self.leader
+
+    def close(self):
+        if self._owned_session is None:
+            return
+        self._owned_session.close()
+        self.leader = None
+        self.authority = None
+        self._owned_session = None
 
 
 def fast_post(op, timeout=2.0, **kw):
@@ -108,12 +157,13 @@ def make_fk():
     return fk_z
 
 
-def main():
+def _main(session_holder):
     ap = argparse.ArgumentParser()
     ap.add_argument('--episodes', type=int, default=10)
     ap.add_argument('--seconds', type=float, default=90)
     ap.add_argument('--hz', type=float, default=15)
     ap.add_argument('--repo', default='so101_teleop_v2')   # bench 는 상태동결 오염 — 새 이름으로 시작
+    ap.add_argument('--leader-port', default='/dev/ttyACM0')
     a = ap.parse_args()
 
     floor = arm_lib.load_gain('floor_z_m')['floor_z_m']
@@ -161,10 +211,9 @@ def main():
     else:
         sys.exit('손목캠 프레임이 안 나옵니다 — 패널·카메라 확인')
 
-    from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
-    leader = SO101Leader(SO101LeaderConfig(
-        port='/dev/ttyACM0', use_degrees=True, id='leader'))
-    leader.connect(calibrate=False)
+    session = LeaderSession(a.leader_port)
+    session_holder.append(session)
+    leader = session.connect()
     print('리더 연결 — 5초 안에 리더를 팔로워와 비슷한 자세로 잡으세요')
     for k in range(5, 0, -1):
         print(f'  {k}...')
@@ -310,8 +359,17 @@ def main():
 
     pd.post('teleop_profile', on=False)
     keys.close()
-    leader.disconnect()
+    session.close()
     print(f'텔레옵 종료 — 저장 {saved}/{a.episodes} · 팔은 마지막 자세 유지(토크 ON)')
+
+
+def main():
+    session_holder = []
+    try:
+        return _main(session_holder)
+    finally:
+        for session in reversed(session_holder):
+            session.close()
 
 
 if __name__ == '__main__':

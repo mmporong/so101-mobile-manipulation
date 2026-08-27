@@ -41,6 +41,7 @@ HSV_CANDIDATES = [
     ('중간', [((0, 110, 50), (12, 255, 255)), ((160, 110, 50), (179, 255, 255))]),
     ('좁음', [((0, 140, 60), (10, 255, 255)), ((166, 140, 60), (179, 255, 255))]),
 ]
+_last_frame_sequence = None
 
 
 def post(op, **kw):
@@ -55,17 +56,13 @@ def get(path):
 
 
 def frame():
-    """손목캠 MJPEG 스트림에서 한 장 — 완전한 JPEG 을 얻을 때까지 읽는다."""
-    r = urllib.request.urlopen(f'{BASE}/cam', timeout=8)
-    buf = b''
-    for _ in range(120):
-        buf += r.read(8192)
-        s = buf.find(b'\xff\xd8')
-        e = buf.find(b'\xff\xd9', s + 2) if s >= 0 else -1
-        if s >= 0 and e > s:
-            return cv2.imdecode(np.frombuffer(buf[s:e + 2], np.uint8),
-                                cv2.IMREAD_COLOR)
-    return None
+    """원자 endpoint에서 freshness가 검증된 손목캠 한 프레임."""
+    global _last_frame_sequence
+    from wrist_yolo import read_atomic_frame
+    image, meta = read_atomic_frame(
+        BASE, timeout=8, previous=_last_frame_sequence)
+    _last_frame_sequence = meta['sequence']
+    return image
 
 
 def _mask(img, ranges):

@@ -24,17 +24,24 @@ import time
 import arm_lib
 
 
-def jog(robot, joint, deg, mapping):
-    obs = robot.get_observation()
-    key = f'{joint}.pos'
-    home = obs[key]
+def jog(api, joint, deg, mapping):
+    state = arm_lib.worker_state(api)
+    pos = state.get('pos')
+    if not isinstance(pos, dict) or joint not in pos:
+        raise arm_lib.WorkerCommandError(f'Worker 상태에 {joint} 현재각이 없습니다')
+    home = float(pos[joint])
     print(f'  {joint}: 현재 {home:+7.2f}° → URDF +방향으로 {deg}° 이동')
     # URDF +방향으로 deg 만큼 = 서보로는 sign*deg 만큼
-    target = home + mapping['signs'][joint] * deg
-    arm_lib.slow_move(robot, {key: target}, seconds=1.5)
+    delta = mapping['signs'][joint] * deg
+    outward = arm_lib.worker_submit_wait(
+        'jog', api=api, wait_timeout=30.0, require_applied=True,
+        joint=joint, delta=delta)
     time.sleep(0.8)
-    arm_lib.slow_move(robot, {key: home}, seconds=1.5)
-    print(f'  {joint}: 복귀 완료. 방금 움직임이 위 docstring 의 +방향 설명과 '
+    returned = arm_lib.worker_submit_wait(
+        'goto', api=api, wait_timeout=30.0, require_applied=True,
+        joint=joint, value=home)
+    print(f'  {joint}: 복귀 완료 ({outward["id"]} → {returned["id"]}). '
+          f'방금 움직임이 위 docstring 의 +방향 설명과 '
           f'반대였다면 mapping.json 에서 이 관절 sign 을 뒤집을 것')
 
 
@@ -43,21 +50,21 @@ def main():
     ap.add_argument('joint', nargs='?', choices=arm_lib.JOINTS)
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--deg', type=float, default=10.0)
-    ap.add_argument('--port', default='/dev/ttyACM0')
-    ap.add_argument('--id', default='follower')
+    ap.add_argument('--api', default=arm_lib.DEFAULT_WORKER_API,
+                    help='실행 중인 패널 Worker API')
+    ap.add_argument('--port', help=argparse.SUPPRESS)
+    ap.add_argument('--id', help=argparse.SUPPRESS)
     a = ap.parse_args()
     if not a.joint and not a.all:
         ap.error('관절 이름을 주거나 --all')
+    if a.port is not None or a.id is not None:
+        ap.error('--port/--id 직접 연결은 폐기되었습니다. --api로 패널 Worker를 지정하세요')
 
     mapping = arm_lib.load_mapping()
-    robot = arm_lib.connect(a.port, a.id)
-    try:
-        for j in (arm_lib.JOINTS if a.all else [a.joint]):
-            jog(robot, j, a.deg, mapping)
-            if a.all:
-                time.sleep(1.0)
-    finally:
-        robot.disconnect()
+    for j in (arm_lib.JOINTS if a.all else [a.joint]):
+        jog(a.api, j, a.deg, mapping)
+        if a.all:
+            time.sleep(1.0)
 
 
 if __name__ == '__main__':

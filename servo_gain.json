@@ -17,7 +17,20 @@
   "jaw_offset_note": "2026-08-18 실측: 손목캠이 그리퍼 하단에 부착돼 카메라가 물체를 크게 담는 자세에서도 죠는 아직 5cm 위에 있다. 전후(x)는 면적 최대 지점이 곧 파지 지점이고, z 만 이만큼 더 내려야 한다. ✎ 첫 판정에서 \"5cm 앞\"을 x 오프셋으로 잘못 적었다 — 사용자 정정으로 z 오프셋임이 확인됨. 카메라를 옮기면 다시 잴 것.",
   "jaw_offset_z_m": -0.05,
   "floor_z_m": -0.238,
-  "floor_note": "2026-08-19 저녁 확정. 두 독립 관측의 일치: ① probe 하강 중 부하가 -0.076~-0.078 에서 하락(-36~-44) — 책상이 팔을 받치며 중력 부하가 줄어드는 접촉 신호 ② 토크 OFF 안착 자세(죠가 책상에 닿음)의 FK z=-0.0785. ±2mm 불확실은 위(안전) 방향. ✎ probe 1차 실행은 임계 +200 이 둔해 -0.120 까지 3.6cm 를 누른 값을 저장했었다 — 절대 임계가 아니라 부하 하락+상승 추세로 잡아야 한다. 베이스·책상 이동, 재캘리브 시 재측정.",
+  "floor_note": "2026-08-26 차량 프로필. 받침대 상판 160mm와 어깨 기준 78mm를 반영한 pan 축 기준 작업면 z=-0.238m. 차량 장착·받침대·캘리브레이션이 바뀌면 probe_floor.py로 재확인할 것. Astra/depth 측정은 차량 활성 경로에서 사용하지 않는다.",
+  "vehicle_geometry": {
+    "platform_height_m": 0.16,
+    "piece_xy_m": [0.19, 0.0],
+    "piece_heights_m": {"cube": 0.02, "lying": 0.011, "standing": 0.035},
+    "shoulder_above_platform_m": 0.078,
+    "floor_expect_half_width_m": 0.012,
+    "probe_start_clearance_m": 0.05,
+    "probe_limit_below_floor_m": 0.012,
+    "box_xy_m": [0.042, -0.142],
+    "box_rim_height_m": 0.065,
+    "drop_transit_clearance_m": 0.048,
+    "drop_release_clearance_m": 0.023
+  },
   "taught_grasp": {
     "q_rad": [
       -0.90143,

@@ -26,10 +26,46 @@ JN = arm_lib.JOINTS                              # 5관절 (gripper 별도)
 LYING_QUAT = (0.7071068, 0.0, 0.7071068, 0.0)    # 원기둥 z축 → x축 (누움)
 ROLL_OFFSET_RAD = math.radians(-90)
 GRIP_HOLD_DEG = 25
-PIECE_H = {'cube': 0.02, 'lying': 0.011, 'standing': 0.035}
-PLATFORM_HEIGHT_M = 0.160
-DEFAULT_PIECE_XY = (0.190, 0.000)
-DROPBOX_XY = (0.042, -0.142)
+VEHICLE_GEOMETRY = arm_lib.vehicle_geometry()
+# 기존 소비자 이름은 유지하되 값은 vehicle_geometry에서만 파생한다.
+PIECE_H = {key: float(value) for key, value in
+           VEHICLE_GEOMETRY['piece_heights_m'].items()}
+PLATFORM_HEIGHT_M = float(VEHICLE_GEOMETRY['platform_height_m'])
+DEFAULT_PIECE_XY = tuple(float(v) for v in VEHICLE_GEOMETRY['piece_xy_m'])
+DROPBOX_XY = tuple(float(v) for v in VEHICLE_GEOMETRY['box_xy_m'])
+
+
+def apply_vehicle_geometry(model, mujoco_module, geometry=VEHICLE_GEOMETRY):
+    """MJCF의 유효 placeholder에 차량 Z 치수를 런타임 주입한다."""
+    height = float(geometry['platform_height_m'])
+    deck_half = 0.004
+    vertical = {
+        'platform_bottom': (deck_half, deck_half),
+        'platform_middle': (height / 2.0, deck_half),
+        'platform_top': (height - deck_half, deck_half),
+    }
+    for name, (center_z, half_z) in vertical.items():
+        geom = model.geom(name)
+        geom.pos[2] = center_z
+        geom.size[2] = half_z
+    post_half = max(0.001, (height - 0.012) / 2.0)
+    post_center = 0.008 + post_half
+    for suffix in ('fl', 'fr', 'rl', 'rr'):
+        geom = model.geom(f'platform_post_{suffix}')
+        geom.pos[2] = post_center
+        geom.size[1] = post_half
+
+    model.geom('piece_body').size[2] = float(
+        geometry['piece_heights_m']['cube'])
+    cylinder = model.geom('piece_cyl_body')
+    cylinder.size[0] = float(geometry['piece_heights_m']['lying'])
+    cylinder.size[1] = float(geometry['piece_heights_m']['standing'])
+    rim_half = float(geometry['box_rim_height_m']) / 2.0
+    for name in ('box_wall_y1', 'box_wall_y2', 'box_wall_x1', 'box_wall_x2'):
+        wall = model.geom(name)
+        wall.pos[2] = rim_half
+        wall.size[2] = rim_half
+    mujoco_module.mj_setConst(model, mujoco_module.MjData(model))
 
 
 def quat_mul(a, b):
@@ -55,10 +91,11 @@ class SimMirror:
         import mujoco
         self.mj = mujoco
         self.model = mujoco.MjModel.from_xml_path(str(D / 'scene_mirror.xml'))
+        apply_vehicle_geometry(self.model, mujoco)
         self.data = mujoco.MjData(self.model)
         self.R, self.t = load_frame()
         self.MP = arm_lib.load_mapping()
-        self.floor = arm_lib.load_gain('floor_z_m')['floor_z_m']
+        self.floor = float(VEHICLE_GEOMETRY['floor_z_m'])
         self.piece = piece
         self.piece_h = PIECE_H[piece]
         self.width, self.height = width, height
@@ -148,7 +185,7 @@ class SimMirror:
             # 빈 닫힘은 ~2 까지 내려가고 큐브(30mm)를 물면 8~24 에서 막혀 멈춘다.
             # 심 쪽 큐브 위치가 낡아 근접 판정이 실패할 수 있으므로, 죠 폭이
             # 물림 대역에서 **정착**(전이폭<0.8)하면 파지다.
-            blocked = (6.0 < now_g < GRIP_HOLD_DEG
+            blocked = (prev_g is not None and 6.0 < now_g < GRIP_HOLD_DEG
                        and abs(now_g - prev_g) < 0.8)
             self._holding = blocked or d < 0.12
         if self._holding:

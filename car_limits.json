@@ -40,5 +40,23 @@
     }
   },
   "pan_lock_tol_deg": 7.0,
+  "pan_lock_center_deg": -15.6,
+  "pan_lock_required": true,
+  "goal_velocity_max": 134,
+  "shoulder_lift_velocity_max": 68,
+  "acceleration": 20,
+  "arm_torque_limit": 800,
+  "pose_max_step_deg": 4.0,
+  "state_max_age_s": 0.5,
+  "base_interlock_required": true,
+  "base_linear_max_mps": 0.01,
+  "base_angular_max_rps": 0.03,
+  "base_stationary_hold_s": 1.0,
+  "base_odom_freshness_s": 0.5,
+  "base_cmd_vel_freshness_s": 0.5,
+  "base_graph_freshness_s": 1.0,
+  "base_capability_lease_s": 0.4,
+  "base_cmd_vel_owner": "collision_monitor",
+  "base_driver_subscriber": "jdamr_base_driver",
   "pan_lock_tol_note": "2026-08-27 충돌 직전 실측 반폭 8.7°에서 1.7° 여유를 둔 현재 배치값. 반지름 190mm에서 좌우 작업폭은 약 ±23mm다."
 }

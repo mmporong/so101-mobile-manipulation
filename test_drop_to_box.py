@@ -5,6 +5,8 @@
       ②그리퍼 무시(개방 거부) → 복귀 없이 정지  ③빈 손 가드  ④--dry
 """
 import math
+import contextlib
+import io
 import pathlib
 import sys
 import threading
@@ -41,6 +43,10 @@ def run_case(name, gripper, argv, expect_exit=None, expect_sub='', **arm_kw):
 
 
 def main():
+    geometry = __import__('arm_lib').vehicle_geometry()
+    assert math.isclose(drop_to_box.TRANSIT_Z, geometry['drop_transit_z'])
+    assert math.isclose(drop_to_box.RELEASE_Z, geometry['drop_release_z'])
+    assert tuple(drop_to_box.BOX_XY) == tuple(geometry['box_xy_m'])
     print('① 정상 완주')
     arm = run_case('정상', 2.5, [])
     ops = [o for o, _ in arm.ops]
@@ -64,7 +70,24 @@ def main():
     arm = run_case('dry', 2.5, ['--dry'])
     assert not arm.ops
 
-    print('\n통과 — drop_to_box 리허설 4사례')
+    print('⑤ 원래 오류와 비상 정지 실패를 함께 보존')
+    old_main, old_post = drop_to_box.main, pd.post
+    drop_to_box.main = lambda: (_ for _ in ()).throw(RuntimeError('original'))
+    pd.post = lambda *_a, **_kw: (_ for _ in ()).throw(OSError('stop failed'))
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            try:
+                drop_to_box.run_cli()
+            except RuntimeError as exc:
+                assert str(exc) == 'original'
+            else:
+                raise AssertionError('원래 오류가 사라짐')
+    finally:
+        drop_to_box.main, pd.post = old_main, old_post
+    assert '비상 정지 요청 실패: OSError: stop failed' in err.getvalue()
+
+    print('\n통과 — drop_to_box 리허설 5사례')
 
 
 if __name__ == '__main__':
