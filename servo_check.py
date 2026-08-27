@@ -5,7 +5,7 @@
 
 ## 쓰는 법
 
-    python3 ~/so101_tools/servo_check.py
+    python3 ~/so101-mobile-manipulation/servo_check.py
 
 서보를 바꿔 물릴 때는 **반드시 전원을 끄고** 한다.
 

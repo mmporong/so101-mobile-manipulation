@@ -34,6 +34,7 @@
 import argparse
 import math
 import pathlib
+import os
 import sys
 import time
 
@@ -51,10 +52,33 @@ TOL_PX = 8.0           # 두 축 합성 픽셀 오차가 이 안이면 정렬 �
 # 조여 산포의 한 성분을 줄인다 — 수렴 1~2스텝 추가 비용뿐.
 STEP_MAX_M = 0.025     # 한 걸음 상한 — 폐루프가 발산해도 크게 안 움직인다
 MAX_ITER = 12
-DRIFT_MAX_M = 0.050    # 정렬 중 시작점에서 벗어날 수 있는 최대 거리
+DRIFT_MAX_M = 0.090   # 50→90mm (2026-08-25): 수동 개입 뒤 큐브가 멀리 있으면 정상 접근도 걸렸다. 밀림은 반응검사(PUSH_RATIO)가 잡는다
 STEP_FIRST_M = 0.035   # 첫 걸음 상한 — DRIFT_MAX_M 보다 작아야 한 걸음에 안 걸린다
 PUSH_RATIO = 0.35      # 예측 대비 픽셀 반응이 이보다 낮으면 밀고 있는 것
 STALL_PX = 3.0         # 오차 개선이 이보다 작으면 정체
+# ★ 지터 보정 (2026-08-26): 자코비안은 기준점 근처에서 잰 **국소 선형화**라
+# 크게 어긋난 지점에서는 예측이 빗나간다. 지터로 일부러 어긋나게 출발한 초반
+# 걸음에서는 반응 검사·정체 판정을 면제해 오탐을 막는다 (실측: 반응 0.30 오탐,
+# 13px 정체). 기준점에 가까워지면 원래 기준이 다시 적용된다.
+JIT_GRACE_ITER = 3     # 지터 사용 시 검사 면제 걸음 수
+# ★ 파지 높이 여유 (2026-08-26 사용자 "내려갈 때 아랫턱이 큐브에 닿는다"):
+# 교시된 절대 높이(-0.0692 = 바닥 위 8.8mm)를 하드코딩하지 않고 **바닥 기준
+# 여유**로 계산한다. 바닥이 바뀌면(거치대·차량 데크) 자동으로 따라가고, 여유가
+# 부족하면 아랫턱이 물체 밑동을 긁는다. 교시값보다 낮아지지는 않게 max 로 묶는다.
+GRASP_CLEAR_M = float(os.environ.get('GRASP_CLEAR_M', '0.0'))
+# ★ 파지 반지름 오프셋 (2026-08-26 "아랫턱과 큐브 사이가 너무 가깝다"):
+# 교시 때 큐브가 아랫턱에 붙어 있었으면 그 관계가 매번 재현된다. 재교시 없이
+# 팔을 **반지름 방향으로 N mm 물러나게/더 들어가게** 조정한다.
+#   양수 = 팔에서 더 멀리(앞으로), 음수 = 팔 쪽으로 당김
+GRASP_R_OFFSET_M = float(os.environ.get('GRASP_R_OFFSET_M', '0.0'))
+# 0.0 = 교시 높이 그대로 (2026-08-26 되돌림): +6mm 여유는 밀림을 못 막았고
+# 기대 픽셀 기준만 흔들었다. 밀림의 진짜 용의자는 롤에 따른 죠 궤적 변화.
+# ★ 파지 품질 신호 (2026-08-26 사용자 "학습 데이터가 큐브를 찌른다"):
+# 찌른 사이클을 데이터셋에 남기면 정책이 찌르는 행동을 배운다. main() 이 이 딕트를
+# 채우고 collect_cycles 가 읽어 **불량 에피소드를 폐기**한다.
+QUALITY = {'push_warn': 0, 'align_px': None, 'held': False, 'blob_shift_px': None,
+           'jitter_mm': None, 'iters': None, 'lateral_mm': None, 'roll_cmd': None,
+           'obs_z': None, 'grasp_z': None, 'lift_z': None, 'grip_after': None}
 AXIS_TOL_DEG = 12.0    # 죠 기준 각도와 이보다 더 벌어지면 비스듬히 물린다
 ROLL_MAX_DEG = 45.0    # 큐브 90° 대칭이라 접힌 각도는 ±45 가 전부 — 전 방향 커버
                        # (2026-08-25 사용자: "캘리브 범위 안에서는 다 작동해도 된다")
@@ -81,7 +105,7 @@ OBS_HOWTO = (
     '그 위에서 그대로 쓰면 도달할 수 없는 목표라, 팔이 오차를 지우려 한 방향으로 '
     '계속 전진해 죠로 물체를 밀어냅니다 (2026-08-21 실측: y 로 76mm 끌고 감).\n'
     '  큐브를 죠 사이에 넣어 물린 뒤:\n'
-    '    ~/miniforge3/envs/lerobot/bin/python ~/so101_tools/wrist_calib.py --ref-obs\n'
+    '    ~/miniforge3/envs/lerobot/bin/python ~/so101-mobile-manipulation/wrist_calib.py --ref-obs\n'
     '  (물체를 문 채 z 만 관찰 높이로 올려 한 장 찍고 제자리로 내려옵니다)')
 
 
@@ -228,12 +252,48 @@ def main():
           f'dcy/dx {J[1,0]:+.0f} dcy/dy {J[1,1]:+.0f}')
 
     pd.post('speed', pct=60)
+    # ★ 접근 지터 (2026-08-26 사용자 제안 "노이즈 처리도 포함") — 관찰 자세를
+    # 일부러 어긋난 곳에서 시작한다. IBVS 가 거기서부터 보정하므로 기록에는
+    # **"화면 한쪽에 치우친 큐브를 가운데로 되돌리는 행동"** 이 남는다. 정책이
+    # 실기에서 어긋났을 때 회복하지 못하던 이유가 이 데이터의 부재였다
+    # (covariate shift — 시연이 늘 완벽하면 실패 상태의 정답을 못 배운다).
+    QUALITY.update(push_warn=0, align_px=None, held=False, blob_shift_px=None,
+                   jitter_mm=None, iters=None, lateral_mm=None, roll_cmd=None,
+                   obs_z=None, grasp_z=None, lift_z=None, grip_after=None)
+    # ★ 팬 잠금 (2026-08-26 차량 장착): 팔이 상판에 클램프로만 물려 있어 좌우
+    # 회전은 즉시 파손이다. 잠금 중에는 **앞뒤(x)·상하(z)만** 쓰고 좌우(y)
+    # 보정을 포기한다 — 큐브를 팔 정면 직선 위에 놓아야 한다.
+    PAN_LOCKED = pd.get('/state').get('pan_lock') is not None
+    RAD_G = arm_lib.load_gain_opt('wrist_jac_radial') if PAN_LOCKED else None
+    PAN_TOL = float(pd.get('/state').get('pan_tol') or 0.0)   # 허용 좌우 회전[°]
+    PAN_LK = float(pd.get('/state').get('pan_lock') or 0.0)
+    if PAN_LOCKED and PAN_TOL > 0:
+        print(f'   팬 허용 ±{PAN_TOL:.1f}° — 그 범위 안에서는 좌우 보정도 합니다')
+    if PAN_LOCKED:
+        print('🔒 팬 잠금 — 좌우 보정 없이 앞뒤·상하만으로 접근합니다')
+    JIT = float(os.environ.get('PICK_JITTER_M', '0') or 0)
+    JIT_ROLL = float(os.environ.get('PICK_JITTER_ROLL', '0') or 0)
     tcp = wc.tcp_now()
     # 관찰 높이는 **교시된 값 하나로 고정**한다. 그 높이에서 물체를 문 채 찍은
     # 목표(obs_px)가 있고, 목표는 높이마다 다르므로 높이가 흔들리면 목표도
     # 무효가 된다. 예전처럼 IK 를 따라 높이를 바꾸지 않는다.
     x, y = tcp[0], tcp[1]
     z = obs_z
+    if JIT > 0:                       # ★ z 정의 뒤에 와야 한다 (2026-08-26 크래시)
+        import random as _rnd
+        for _ in range(6):            # 리치 안에 드는 지터를 뽑는다
+            if PAN_LOCKED:                     # 지터도 반지름 방향으로만
+                n_r = float(np.hypot(x, y)) or 1e-6
+                s = _rnd.uniform(-JIT, JIT)
+                jx, jy = s * x / n_r, s * y / n_r
+            else:
+                jx = _rnd.uniform(-JIT, JIT)
+                jy = _rnd.uniform(-JIT, JIT)
+            if reachable(x + jx, y + jy, z):
+                x, y = x + jx, y + jy
+                QUALITY['jitter_mm'] = float(np.hypot(jx, jy) * 1000)
+                print(f'접근 지터: ({jx*1000:+.0f}, {jy*1000:+.0f}) mm 어긋난 곳에서 시작')
+                break
     if not reachable(x, y, z):
         sys.exit(f'관찰 높이 z={z:+.4f} 에 지금 자리({x:+.3f},{y:+.3f})에서 IK 해가 '
                  f'없습니다 — 팔을 작업 영역 안으로 옮기고 다시 실행하세요. 더 '
@@ -242,9 +302,7 @@ def main():
     open_deg = pd.GRIP_OPEN.get('cube', 45)
     g0 = pd.get('/state')['pos'].get('gripper', 0)
     if g0 < open_deg - 5:
-        pd.post('goto', joint='gripper', value=round(g0, 1))
-        time.sleep(0.35)
-        pd.post('goto', joint='gripper', value=open_deg)
+        pd.grip_close_ramp(open_deg, steps=4, dt=0.14)   # 개방 램프 (10% 감속·균일)
         pd.wait_gripper_settle(target=open_deg)
     ok, why = safe_move(x, y, z)
     if not ok:
@@ -261,6 +319,9 @@ def main():
     Jinv = np.linalg.inv(J)
     lam = 0.7                        # 감쇠 — 1.0 은 야코비안 오차에 오버슛한다
     x0, y0 = x, y                    # 시작점 — 여기서 크게 벗어나면 끌고 가는 중
+    TH0 = math.degrees(math.atan2(y0, x0))   # 팬 허용 범위의 기준 방위각
+    # 지터로 일부러 어긋나게 출발했으면 그만큼 더 움직여야 정상이다
+    drift_max = DRIFT_MAX_M + (JIT * 1.5 if JIT > 0 else 0.0)
     prev = None                      # (cx, cy, 명령한 이동 d) — 반응 검증용
     best_err, stall = None, 0
     push = 0
@@ -284,24 +345,53 @@ def main():
         tgt = obs_px
         e = np.array([tgt[0] - cx, tgt[1] - cy], float)         # 픽셀 오차
         d = Jinv @ e * lam                                      # → 팔 이동 [m]
-        err_px = float(np.linalg.norm(e))
+        if PAN_LOCKED:
+            # 화면 오차를 반지름 성분(고칠 수 있는 것)과 접선 성분(못 고치는 것)
+            # 으로 나눈다. 판정은 반지름 성분으로, 접선 성분이 크면 사람이
+            # 큐브를 옮겨야 한다.
+            n_r = float(np.hypot(x, y)) or 1e-6
+            u = np.array([x / n_r, y / n_r])
+            d_full = Jinv @ e                      # 필요한 팔 이동 [m]
+            e_r = J @ (float(d_full @ u) * u)      # 반지름 방향 픽셀 오차
+            err_px = float(np.linalg.norm(e_r))
+            QUALITY['iters'] = it
+            tvec = np.array([-u[1], u[0]])         # 접선(좌우) 단위벡터
+            lateral_m = float(d_full @ tvec)       # 좌우로 필요한 이동 [m] (부호 포함)
+            tangential = abs(lateral_m) * 1000.0   # mm
+            QUALITY['lateral_mm'] = float(lateral_m * 1000.0)
+        else:
+            err_px = float(np.linalg.norm(e))
+            tangential = 0.0
+        # 죠 여유 기준: 죠 벌림 65mm − 큐브 40mm = 한쪽 12.5mm. 안전하게 10mm.
+        if PAN_LOCKED and tangential > 10.0 + PAN_TOL * 3.3:
+            side = '왼쪽' if lateral_m > 0 else '오른쪽'
+            sys.exit(f'큐브가 팔 정면 직선에서 좌우로 {tangential:.0f}mm 벗어나 '
+                     f'있습니다 (팬 잠금이라 보정 불가) — 큐브를 팔에서 볼 때 '
+                     f'{side}으로 약 {tangential:.0f}mm 옮겨 주세요')
 
         # ── 밀고 있는가: 직전에 명령한 이동이 픽셀을 예측만큼 옮겼는지 본다.
         # 물체가 죠에 밀려 같이 따라오면 팔은 움직이는데 그림은 그대로다.
         if prev is not None:
             pcx, pcy, pd_ = prev
-            pred = J @ pd_
+            if PAN_LOCKED and RAD_G is not None:
+                n_r2 = float(np.hypot(x, y)) or 1e-6
+                u2 = np.array([x / n_r2, y / n_r2])
+                pred = np.array([RAD_G['dcx_dr'], RAD_G['dcy_dr']], float) * float(pd_ @ u2)
+            else:
+                pred = J @ pd_
             if float(np.linalg.norm(pred)) > 8.0:
                 meas = np.array([cx - pcx, cy - pcy], float)
                 ratio = float(meas @ pred) / float(pred @ pred)
                 mark = ''
-                if ratio < PUSH_RATIO:
+                if ratio < PUSH_RATIO and not (JIT > 0 and it <= JIT_GRACE_ITER):
                     push += 1
                     mark = f'  ⚠반응 {ratio:.2f}'
                 else:
                     push = 0
                 print(f'     예측 ({pred[0]:+5.1f},{pred[1]:+5.1f})px · '
                       f'실측 ({meas[0]:+5.1f},{meas[1]:+5.1f})px{mark}')
+                if ratio < PUSH_RATIO:
+                    QUALITY['push_warn'] += 1
                 if push >= 2:
                     sys.exit(
                         f'[{it}] 팔은 움직이는데 물체가 화면에서 안 따라옵니다 '
@@ -313,11 +403,30 @@ def main():
             best_err, stall = err_px, 0
         else:
             stall += 1
+            if JIT > 0 and it <= JIT_GRACE_ITER:
+                stall = 0                 # 지터 초반은 자코비안 오차로 느릴 수 있다
             if stall >= 3:
                 sys.exit(f'[{it}] 오차가 {best_err:.1f}px 아래로 3회 연속 안 줄어듭니다 '
                          f'(이동 중단) — 목표 픽셀이나 높이 이득이 틀렸을 수 '
                          f'있습니다. 물체를 밀기 전에 멈춥니다')
 
+        if PAN_LOCKED:
+            # ★ 팬 잠금 = 반지름 방향 1자유도. 벤치 자코비안(J)은 차량 자세에서
+            # 32% 과대평가라 반응 검사가 오탐했다(2026-08-26 실측 -2217 → -1518).
+            # 차량에서 잰 반지름 이득이 있으면 그걸로 직접 푼다:
+            #   e[px] = grad[px/m] · dr[m]  →  dr = (e·grad)/(grad·grad)
+            n_r = float(np.hypot(x, y)) or 1e-6
+            u = np.array([x / n_r, y / n_r])
+            if PAN_TOL > 0:
+                # 허용 범위가 있으면 좌우 보정도 살린다 — 다만 결과 목표의
+                # 팬 각이 [잠금±허용] 을 넘지 않게 뒤에서 클램프한다.
+                pass                               # d 를 그대로 쓴다
+            elif RAD_G is not None:
+                grad = np.array([RAD_G['dcx_dr'], RAD_G['dcy_dr']], float)
+                dr = float(e @ grad) / float(grad @ grad)
+                d = dr * u
+            else:
+                d = float(d @ u) * u               # 폴백: 벤치 J 의 반지름 성분
         cap = STEP_FIRST_M if it == 1 else STEP_MAX_M
         n = float(np.linalg.norm(d))
         if n > cap:
@@ -330,9 +439,20 @@ def main():
         if ok:
             break
         nx, ny = x + float(d[0]), y + float(d[1])
+        if PAN_LOCKED and PAN_TOL > 0:            # 팬 허용 범위로 목표를 접는다
+            # ★ 기준은 **TCP 시작 각도**다 (2026-08-27). 서보 팬 각(-22.5°)과
+            # TCP 방위각(+21.3°)은 부호 규약이 달라서, 서보 각으로 클램프하면
+            # 목표가 원점 반대편으로 튄다(실측: 한 걸음에 113mm 이탈).
+            _r = float(np.hypot(nx, ny)) or 1e-6
+            _th = math.degrees(math.atan2(ny, nx))
+            _lo, _hi = TH0 - PAN_TOL, TH0 + PAN_TOL
+            _thc = min(max(_th, _lo), _hi)
+            if abs(_thc - _th) > 0.05:
+                nx, ny = (_r * math.cos(math.radians(_thc)),
+                          _r * math.sin(math.radians(_thc)))
         # ── 끌고 가기 방지: 시작점에서 이만큼 벗어났다면 물체를 밀며 따라가는 중
         drift = math.hypot(nx - x0, ny - y0)
-        if drift > DRIFT_MAX_M:
+        if drift > drift_max:
             sys.exit(f'[{it}] 정렬 시작점에서 {drift*1000:.0f}mm 벗어났습니다 '
                      f'(상한 {DRIFT_MAX_M*1000:.0f}mm · 이동 중단) — 폐루프가 '
                      f'물체를 밀며 쫓아갈 때 나오는 모습입니다')
@@ -374,6 +494,7 @@ def main():
                 sys.exit(f'각도 접기 이상: gap {gap:+.1f}° — 검출을 확인하세요')
             roll_cmd = float(np.clip(-gap / slope,
                                      -ROLL_CMD_MAX_DEG, ROLL_CMD_MAX_DEG))
+            QUALITY['roll_cmd'] = float(roll_cmd)
             print(f'롤 보정: wrist_roll {roll_cmd:+.1f}° 로 하강 '
                   f'(기울기 {slope:+.2f})')
     elif axis is not None:
@@ -396,9 +517,7 @@ def main():
     g_now = pd.get('/state')['pos'].get('gripper', 0)
     if g_now < open_deg - 5:
         print(f'죠 개방 ({g_now:.1f} → {open_deg})')
-        pd.post('goto', joint='gripper', value=round(g_now, 1))   # 보호 해제
-        time.sleep(0.35)
-        pd.post('goto', joint='gripper', value=open_deg)
+        pd.grip_close_ramp(open_deg, steps=4, dt=0.14)   # 개방 램프 (10% 감속·균일)
         g_open = pd.wait_gripper_settle(target=open_deg)
         if g_open is None or g_open < open_deg - 8:
             sys.exit(f'죠가 안 열립니다 (지금 {g_open}) — 닫힌 채 내려가면 '
@@ -407,6 +526,19 @@ def main():
     else:
         print(f'죠 이미 열림 ({g_now:.1f})')
 
+    QUALITY['align_px'] = float(err_px) if 'err_px' in dir() else None
+    QUALITY['obs_z'] = float(obs_z)
+    # 파지 높이 — 바닥 기준 여유로 계산 (하드코딩 금지)
+    grasp_z = max(ref_tcp[2], floor + GRASP_CLEAR_M)
+    if abs(GRASP_R_OFFSET_M) > 1e-5:               # 반지름 방향 미세 조정
+        _r = float(np.hypot(x, y)) or 1e-6
+        x += GRASP_R_OFFSET_M * x / _r
+        y += GRASP_R_OFFSET_M * y / _r
+        print(f'파지 오프셋: 반지름 {GRASP_R_OFFSET_M*1000:+.0f}mm 적용')
+    QUALITY['grasp_z'] = float(grasp_z)
+    if grasp_z > ref_tcp[2] + 1e-4:
+        print(f'파지 높이 보정: 교시 {ref_tcp[2]:+.4f} → {grasp_z:+.4f} '
+              f'(바닥 {floor:+.3f} + 여유 {GRASP_CLEAR_M*1000:.0f}mm)')
     pd.post('speed', pct=25)
     # ★ 롤 선행 (2026-08-25 사용자 지시) — 손목 롤은 **관찰 높이에서 먼저
     # 끝내고** 내려간다. 회전과 하강을 동시에 하면 죠 끝이 스윙하며 큐브
@@ -418,13 +550,14 @@ def main():
             sys.exit(f'롤 선행 회전 실패: {why}')
         time.sleep(0.3)
     for _try in (1, 2):
-        print(f'교시 높이로 하강 (z {z:+.3f} → {ref_tcp[2]:+.3f})'
+        print(f'파지 높이로 하강 (z {z:+.3f} → {grasp_z:+.3f}'
+              f' · 바닥 위 {1000*(grasp_z-floor):.0f}mm)'
               + (f' · 롤 {roll_cmd:+.1f}°' if roll_cmd is not None else '')
               + ('' if _try == 1 else ' · 재시도'))
-        ok, why = safe_move(x, y, ref_tcp[2], timeout=40, roll=roll_cmd)
+        ok, why = safe_move(x, y, grasp_z, timeout=40, roll=roll_cmd)
         if not ok:
             sys.exit(f'교시 높이로 못 내려갑니다: {why}')
-        z = ref_tcp[2]
+        z = grasp_z
         if observe(ranges) is not None:
             break
         # 하강 후 실명 — 위치 의존 시야 편차로 죠가 물체를 가릴 수 있다
@@ -456,10 +589,19 @@ def main():
     if obs is None:
         sys.exit('하강 후 물체를 못 봅니다 (이동 중단) — 죠가 가렸을 수 있습니다')
     area, cx, cy, axis = obs
-    e = np.array([ref_px[0] - cx, ref_px[1] - cy], float)
-    err_px = float(np.linalg.norm(e))
-    print(f'  화면 ({cx:6.1f},{cy:6.1f}) 목표 ({ref_px[0]:5.1f},{ref_px[1]:5.1f}) '
-          f'오차 |{err_px:5.1f}|px · 각도 {axis:4.1f}°')
+    # ★ 기대 픽셀을 높이로 보간한다 (2026-08-26): ref_px 는 교시 높이(-0.0692)
+    # 에서 잰 값이라, 여유를 두고 더 높은 곳(grasp_z)에서 멈추면 큐브는 화면의
+    # 다른 자리에 보인다. 그대로 비교하면 정상 파지도 "오차 50px" 로 걸린다
+    # (실측: 그 오탐 때문에 하강만 하고 버려짐). 관찰 높이 기준(obs_px)과
+    # 교시 높이 기준(ref_px) 사이를 실제 높이 비율로 섞어 기대값을 만든다.
+    span = (obs_z - ref_tcp[2]) or 1e-6
+    frac = min(max((obs_z - grasp_z) / span, 0.0), 1.0)      # 1.0 = 교시 높이
+    exp_px = (obs_px[0] + (ref_px[0] - obs_px[0]) * frac,
+              obs_px[1] + (ref_px[1] - obs_px[1]) * frac)
+    e = np.array([exp_px[0] - cx, exp_px[1] - cy], float)
+    err_px = (abs(float(e[0])) if PAN_LOCKED else float(np.linalg.norm(e)))
+    print(f'  화면 ({cx:6.1f},{cy:6.1f}) 목표 ({exp_px[0]:5.1f},{exp_px[1]:5.1f}) '
+          f'오차 |{err_px:5.1f}|px · 각도 {axis:4.1f}° · 높이비율 {frac:.2f}')
     if err_px > GRASP_TOL_PX:
         sys.exit(f'하강 후 오차 {err_px:.1f}px 가 죠 여유(≈{GRASP_TOL_PX:.0f}px)를 '
                  f'넘습니다 — 닫으면 한쪽 패드가 큐브 위를 칩니다. 이동 중단. '
@@ -471,10 +613,7 @@ def main():
                      f'(허용 ±{AXIS_TOL_DEG:.0f}°, 이동 중단) — 내려오는 동안 물체가 '
                      f'죠에 밀려 돌아갔을 수 있습니다')
     print('파지')
-    g_now = pd.get('/state')['pos'].get('gripper', 45)
-    pd.post('goto', joint='gripper', value=round(g_now, 1))   # 보호 해제
-    time.sleep(0.4)
-    pd.post('goto', joint='gripper', value=pd.GRIP_CLOSE_ABS)
+    pd.grip_close_ramp(pd.GRIP_CLOSE_ABS)     # 보호해제+램프 닫기 (25% 감속·균일화)
     g = pd.wait_gripper_settle()
     if g is None:
         g = pd.get('/state')['pos'].get('gripper')
@@ -492,19 +631,29 @@ def main():
     # 방금 정렬을 그 높이에서 했으니 IK 가 풀리는 것이 이미 확인된 자리다.
     pd.post('speed', pct=35)
     print('들어올리기')
+    # ★ 파지 후 더 높이 든다 (2026-08-26 사용자 지시): 종전엔 관찰 높이까지만
+    # 올려서 **집기 전후 자세가 거의 같아** 성공/실패를 눈으로 구분할 수 없었다.
+    # IK 가 풀리는 한도에서 관찰 높이보다 더 올린다.
     lift_z = obs_z
+    for extra in (0.060, 0.045, 0.030, 0.015):
+        if reachable(x, y, obs_z + extra):
+            lift_z = obs_z + extra
+            print(f'들어올리기: 관찰 높이보다 {extra*1000:.0f}mm 더 위로')
+            QUALITY['lift_z'] = float(lift_z)
+            break
     ok, why = safe_move(x, y, lift_z, timeout=35, roll=roll_cmd)
     if not ok:
         print(f'⚠ 들어올리기 실패: {why} — 물체는 물고 있습니다')
-    if ok and roll_cmd is not None:
-        # 든 채로 롤 0 복귀 — 내려놓으면 반듯해진다 (각도 오차 자가 치유)
-        ok2, why2 = safe_move(x, y, lift_z, timeout=25, roll=0.0)
-        print('롤 0 복귀 — 내려놓기가 반듯해집니다' if ok2
-              else f'⚠ 롤 복귀 실패: {why2}')
+    # ★ 파지 후 롤 복귀 제거 (2026-08-26 사용자 지시): 잡은 뒤 손목을 되돌릴
+    # 이유가 없다 — 각도 다양성은 **내려놓을 때 회전**(collect_cycles 의
+    # PLACE_ROLL_DEG)이 이미 만든다. 물체를 문 채 도는 동작은 시간만 쓰고
+    # 죠 안에서 물체가 돌아갈 위험만 더한다. 잡은 롤 그대로 옮긴다.
     obs = observe(ranges)
     floor = arm_lib.load_gain('floor_z_m')['floor_z_m']
     tgt = area_at(lift_z, ref_area, ref_tcp[2], floor + 0.02)
     if obs and obs[0] > tgt * 0.5:
+        QUALITY['held'] = True
+        QUALITY['grip_after'] = float(pd.get('/state')['pos'].get('gripper', 0))
         print(f'판정: 물었음 (면적 {obs[0]:.0f} / 기대 {tgt:.0f} — 죠를 따라옴)')
     else:
         print(f'판정: 놓친 듯 (면적 {obs[0] if obs else 0:.0f} / 기대 {tgt:.0f})')

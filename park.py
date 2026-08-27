@@ -124,7 +124,7 @@ def main():
     # 뽑고 smooth_move 가 한 번에 흘린다 — '끄덕끄덕' 제거. 걸음별 FK 가드는
     # 계획 단계에서 동일 적용, 실행 중엔 실측 z 하한·⛔·토크·지연 감시.
     import pathlib as _pl
-    sys.path.insert(0, str(_pl.Path.home() / 'so101_tools'))
+    sys.path.insert(0, str(_pl.Path.home() / 'so101-mobile-manipulation'))
     import smooth_move as sm
     pos = {j: state()['pos'][j] for j in J}
     start = dict(pos)
@@ -141,17 +141,27 @@ def main():
             pos = {**pos, joint: pos[joint] + step}
             waypoints.append(dict(pos))
     if waypoints:
-        ticks = sm.plan(start, waypoints, speed_dps=27.0)
+        ticks = sm.plan(start, waypoints, speed_dps=13.0)
         zmin_plan = sm.sweep_z(ticks)
         print(f'접기 계획: 웨이포인트 {len(waypoints)} · 틱 {len(ticks)} · '
               f'경로 최저 z {zmin_plan:+.4f}')
         if zmin_plan - protrude < floor + Z_MARGIN - 0.003:
             bail(f'계획 경로 z 위반 ({zmin_plan:+.4f}) — 실행 안 함')
-        try:
-            sm.stream(ticks, z_floor=floor + Z_MARGIN + protrude - 0.006)
-        except RuntimeError as e:
-            post('stop')
-            bail(str(e))
+        # 지연 트립이면 절반 속도로 한 번 더 (2026-08-26: 롤아웃 뒤 특이 자세에서
+        # wrist_flex 26° 지연 실측 — 속도 문제면 여기서 끝나고, 진짜 걸림이면 또 선다)
+        for attempt, sp in enumerate((None, 13.0)):
+            if sp is not None:
+                cur = {j: state()['pos'][j] for j in J}
+                ticks = sm.plan(cur, waypoints, speed_dps=sp)
+                print(f'  지연 트립 → {sp:.0f}°/s 로 재시도')
+            try:
+                sm.stream(ticks, z_floor=floor + Z_MARGIN + protrude - 0.006)
+                break
+            except RuntimeError as e:
+                post('stop')
+                if attempt == 1 or '추종 지연' not in str(e):
+                    bail(str(e))
+                time.sleep(1.0)
     for joint in ORDER:
         print(f'  {joint:14s} → {state()["pos"][joint]:+7.1f}° '
               f'(목표 {float(park[joint]):+.1f})')

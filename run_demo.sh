@@ -6,7 +6,7 @@
 #
 # 전제: 패널 서버(8765)·뎁스 데몬(8766) 가동, 팔은 휴지 자세(토크 무관),
 #       빨간 체스말이 픽업 존에 놓여 있을 것 (뎁스캠 검출을 스스로 확인한다)
-# 사용: bash ~/so101_tools/run_demo.sh
+# 사용: bash ~/so101-mobile-manipulation/run_demo.sh
 # 중단: Ctrl-C → 팔 정지(토크 유지) 후 녹화 마감까지 하고 종료
 set -u
 POSE="${1:-cube}"            # cube(기본, 4×4cm 빨간 큐브) | lying | standing
@@ -14,7 +14,7 @@ POSE="${1:-cube}"            # cube(기본, 4×4cm 빨간 큐브) | lying | stan
 # 정합(handeye.json)은 카메라를 옮기면 무효라, 캠이 움직일 수 있는 구성에서는
 # 폐루프가 기본이다 (2026-08-21).
 PICK="${PICK:-wrist}"
-TOOLS="$HOME/so101_tools"
+TOOLS="$HOME/so101-mobile-manipulation"
 OUT="$TOOLS/media/$(date +%Y-%m-%d)"
 TS="$(date +%H%M%S)"
 SIMPY="$HOME/miniforge3/envs/rlwalk/bin/python"

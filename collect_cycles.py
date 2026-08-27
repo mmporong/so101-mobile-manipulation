@@ -23,6 +23,7 @@ ACT 학습에는 수십 에피소드가 필요한데, 상자에 떨어뜨리는 
 """
 import pathlib
 import random
+import os
 import sys
 import time
 
@@ -35,17 +36,42 @@ import pick_demo as pd                             # noqa: E402
 import pick_wrist as pw                            # noqa: E402
 import wrist_calib as wc                           # noqa: E402
 
-REPO = 'so101_pick_pm'      # 포인트맵 포함 신규 수집 (구 so101_pick_place 는 상태동결 오염)
+REPO = 'so101_car'          # 차량 기하·손목캠 전용 (2026-08-26). 벤치 데이터와 섞지 않는다      # 품질 게이트 통과분만 (2026-08-26). 구 so101_pick_pm 은
+                            # 게이트 이전 수집이라 밀림·헛집음 시연이 섞여 있다.
 TASK = 'pick the red cube and place it on the table'
 FPS = 10
 # 내려놓기 존 — IK 로 매번 확인하므로 넉넉히 잡고, 안 풀리는 표본은 버린다
-PLACE_X = (0.165, 0.210)
-PLACE_Y = (-0.075, 0.075)
+PLACE_X = (0.150, 0.230)   # 넓힘 (2026-08-26): 좁은 존은 '같은 데이터'만 만든다
+PLACE_Y = (-0.105, 0.105)  # 넓힘 — 큐브 위치 다양성이 정책의 시각 보정을 만든다
 MIN_MOVE_M = 0.03      # 집은 자리와 이만큼은 떨어진 곳에 놓는다 — 배치 다양성
 # 내려놓을 때 죠 롤을 무작위로 — 큐브가 돌아간 채 놓여서, 다음 에피소드가
 # 자동으로 회전 보정 파지가 된다. 각도 다양성을 사람 없이 분포에 넣는 장치
 # (2026-08-24 사용자 지적: "같은 방향만 집는다"). 상한은 롤 보정 한계(30°) 안.
-PLACE_ROLL_DEG = 15.0
+PLACE_ROLL_DEG = 40.0      # 넓힘 — 롤 보정은 ±45 까지 대응 가능(전 각도 커버)
+
+QUALITY_ALIGN_PX = 10.0    # 이보다 크게 어긋난 채 하강한 시연은 버린다 (2026-08-26)
+
+
+def _qrow(q):
+    """pick_wrist.QUALITY → CSV 열 매핑 (2026-08-26 기록 지시)."""
+    st = pd.get('/state')
+    return {'pan_lock_deg': st.get('pan_lock'),
+            'jitter_mm': q.get('jitter_mm'),
+            'iters': q.get('iters'),
+            'err_px': q.get('align_px'),
+            'lateral_mm': q.get('lateral_mm'),
+            'roll_cmd_deg': q.get('roll_cmd'),
+            'obs_z': q.get('obs_z'),
+            'grasp_z': q.get('grasp_z'),
+            'lift_z': q.get('lift_z'),
+            'grip_after': q.get('grip_after'),
+            'held': q.get('held'),
+            'push_warn': q.get('push_warn')}
+
+
+class _Reject(Exception):
+    """품질 미달 — 에피소드를 버리고 재시도한다 (실패와 구분)."""
+
 TEMP_WARN = 45         # 서보 온도 경고 [℃]
 TEMP_STOP = 50         # 이 온도부터는 수집을 멈춘다 — 스톨된 서보는 탄다
 MAX_SAMPLE = 60        # 무작위 목표 표본 상한
@@ -76,9 +102,18 @@ def temps_ok():
 
 def sample_place(x0, y0, z_obs, z_place):
     """집은 자리에서 MIN_MOVE 이상 떨어진, 두 높이 모두 IK 가 풀리는 지점."""
+    # ★ 팬 잠금 (2026-08-26): 좌우로 옮기려면 팬을 돌려야 하는데 클램프 장착
+    # 상태에서는 금지다. 팔이 향한 **직선 위에서 앞뒤로만** 내려놓는다.
+    _locked = pd.get('/state').get('pan_lock') is not None
+    _r0 = float(np.hypot(x0, y0)) or 1e-6
+    _ux, _uy = x0 / _r0, y0 / _r0
     for _ in range(MAX_SAMPLE):
-        tx = random.uniform(*PLACE_X)
-        ty = random.uniform(*PLACE_Y)
+        if _locked:
+            r = random.uniform(*PLACE_X)      # 반지름(팔에서의 거리)만 무작위
+            tx, ty = r * _ux, r * _uy
+        else:
+            tx = random.uniform(*PLACE_X)
+            ty = random.uniform(*PLACE_Y)
         if np.hypot(tx - x0, ty - y0) < MIN_MOVE_M:
             continue
         if pw.reachable(tx, ty, z_obs) and pw.reachable(tx, ty, z_place):
@@ -104,8 +139,15 @@ def place_at(tx, ty, z_obs, z_place, ranges):
     """문 큐브를 (tx,ty) 에 무작위 롤로 내려놓고 관찰 높이로 복귀."""
     roll = round(random.uniform(-PLACE_ROLL_DEG, PLACE_ROLL_DEG), 1)
     print(f'  플레이스 롤 {roll:+.1f}° (다음 에피소드의 회전 다양성)')
+    # ★ 운반은 **더 높은 곳에서** (2026-08-26): 집은 높이와 내려놓는 높이가
+    # 비슷하면 성공/실패를 눈으로 못 가린다. 현재 높이(파지 후 상승 지점)를
+    # 유지한 채 수평 이동하고, 목표 위에서만 내려간다.
+    cur_z = pw.wc.tcp_now()[2] if hasattr(pw, 'wc') else z_obs
+    z_move = max(z_obs, cur_z)
     pd.post('speed', pct=40)
-    ok, why = pw.safe_move(tx, ty, z_obs, timeout=35, roll=roll)
+    ok, why = pw.safe_move(tx, ty, z_move, timeout=35, roll=roll)
+    if not ok:
+        ok, why = pw.safe_move(tx, ty, z_obs, timeout=35, roll=roll)
     if not ok:
         sys.exit(f'플레이스 지점 수평 이동 실패: {why}')
     pd.post('speed', pct=25)
@@ -129,6 +171,13 @@ def place_at(tx, ty, z_obs, z_place, ranges):
 
 
 def main():
+    # ★ 접근 지터 기본 25mm (2026-08-26) — pick_wrist 가 일부러 어긋난 곳에서
+    # 시작해 IBVS 로 되돌아온다. 그 보정 궤적이 정책의 "회복 능력" 학습 재료다.
+    os.environ.setdefault('PICK_JITTER_M', '0.015')
+    # ★ 파지 반지름 오프셋 (2026-08-26 "큐브가 아랫턱을 파고드는 형국"):
+    # 팔을 6mm 뒤로 당겨 큐브가 죠 가운데 오게 한다 (여유 12.5mm 의 절반).
+    os.environ.setdefault('GRASP_R_OFFSET_M', '-0.006')   # 25→15mm: 자코비안 선형 구간 안 (2026-08-26)
+
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     st = pd.get('/state')
     if not (st['connected'] and st['calibrated'] and st['torque']):
@@ -153,9 +202,19 @@ def main():
         print(f'\n━━ 사이클 {cyc}/{n}')
         fatal = False
         for attempt in (1, 2, 3):
-            r = rec('rec_start', repo_id=REPO, task=TASK, fps=FPS, pointmap=True)
-            if not r.get('ok'):
-                print('기록 시작 실패 — 수집 중단')
+            r = None
+            for _rt in range(4):                   # 데몬 재기동 순간 등 일시 실패 흡수
+                # ★ 손목캠 전용 기록 (2026-08-26): 정책 입력이 손목캠 하나로
+                # 확정됐고 차에는 뎁스캠을 싣지 않는다. 뎁스·포인트맵을 요구하면
+                # 뎁스캠 없는 환경에서 기록이 통째로 거부된다.
+                r = rec('rec_start', repo_id=REPO, task=TASK, fps=FPS,
+                        depth=False, pointmap=False, timeout=120)
+                if r.get('ok'):
+                    break
+                print(f'  기록 시작 실패({r.get("msg")}) — 10초 뒤 재시도 {_rt+1}/3')
+                time.sleep(10.0)
+            if not (r and r.get('ok')):
+                print(f'기록 시작 재시도 소진({r.get("msg")}) — 수집 중단')
                 fatal = True
                 break
             try:
@@ -167,11 +226,43 @@ def main():
                     sys.exit('내려놓을 지점을 못 뽑았습니다 — 존이 리치 밖입니다')
                 print(f'  플레이스 → ({tx:+.3f},{ty:+.3f})')
                 place_at(tx, ty, z_obs, z_place, ranges)
+                # ★ 품질 게이트 (2026-08-26): 죠가 큐브를 찌른 사이클을 저장하면
+                # 정책이 **찌르는 행동을 배운다**. 실기 정책이 큐브를 계속 치던
+                # 원인이 이 오염이다. 시연이 깔끔했을 때만 데이터로 남긴다.
+                q = pw.QUALITY
+                bad = []
+                if q.get('push_warn', 0) >= 1:
+                    bad.append(f"밀림 경고 {q['push_warn']}회")
+                if q.get('align_px') is not None and q['align_px'] > QUALITY_ALIGN_PX:
+                    bad.append(f"정렬 오차 {q['align_px']:.1f}px")
+                if not q.get('held'):
+                    bad.append('파지 판정 실패')
+                if bad:
+                    print(f"  ⊘ 품질 미달({', '.join(bad)}) — 이 에피소드는 버립니다")
+                    rec('rec_cancel')
+                    pd.csv_log(repo=REPO, cycle=cyc, result='reject',
+                               reason=','.join(bad), **_qrow(q))
+                    fatal = False
+                    raise _Reject()
+                pd.csv_log(repo=REPO, cycle=cyc, result='ok', reason='',
+                           place_r_mm=float(np.hypot(tx, ty)) * 1000, **_qrow(q))
                 break                              # 이 사이클 성공
+            except _Reject:
+                if attempt < 3:
+                    print(f'  ↻ 품질 미달 — 다시 시도 ({attempt}/2)')
+                    tcp = wc.tcp_now()
+                    ok2, _ = pw.safe_move(tcp[0], tcp[1], z_obs, timeout=35)
+                    if ok2:
+                        time.sleep(0.5)
+                        continue
+                print('  품질 미달 재시도 소진 — 다음 사이클로')
+                break
             except SystemExit as e:
                 msg = str(e)
                 print(f'  ✗ 실패: {msg}')
                 rec('rec_cancel')
+                pd.csv_log(repo=REPO, cycle=cyc, result='fail',
+                           reason=msg[:90], **_qrow(pw.QUALITY))
                 if attempt < 3 and any(k in msg for k in RETRYABLE):
                     print(f'  ↻ 시야·수렴 계열 — 관찰 높이 복귀 후 재시도 '
                           f'({attempt}/2)')

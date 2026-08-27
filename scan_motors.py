@@ -6,8 +6,8 @@ ID 부여(`lerobot-setup-motors`) 전후로 "지금 뭐가 몇 번으로 붙어 
 
 사용:
     conda activate lerobot
-    python3 ~/so101_tools/scan_motors.py                 # 기본 /dev/ttyACM0
-    python3 ~/so101_tools/scan_motors.py /dev/ttyACM1
+    python3 ~/so101-mobile-manipulation/scan_motors.py   # 기본 /dev/ttyACM0
+    python3 ~/so101-mobile-manipulation/scan_motors.py /dev/ttyACM1
 
 ## 응답이 0개일 때 보는 순서 (2026-08-14 실측)
 

@@ -66,7 +66,8 @@ def cmd_goto(pose, x, y):
     tcp = wc.tcp_now()
     print(f'도달 TCP ({tcp[0]:+.3f},{tcp[1]:+.3f},{tcp[2]:+.3f}) · 그리퍼 열림')
     print('\n이제 **큐브를 죠 사이에 밀어 넣어** 주세요. 넣으신 뒤:')
-    print('  ~/miniforge3/envs/lerobot/bin/python ~/so101_tools/teach_grasp.py --teach')
+    print('  ~/miniforge3/envs/lerobot/bin/python '
+          '~/so101-mobile-manipulation/teach_grasp.py --teach')
 
 
 def cmd_teach(pose):

@@ -26,7 +26,7 @@ import arm_lib                                     # noqa: E402
 
 BASE = 'http://127.0.0.1:8765'
 J5 = arm_lib.JOINTS
-MARGIN_DEG = 1.2
+MARGIN_DEG = 2.6   # 패널 LIMIT_MARGIN_DEG(2.0)보다 커야 한다 — 작으면 경계 틱이 거부돼 지연 트립 (2026-08-25 파킹 실측)
 
 
 def _post(op, timeout=3.0, **kw):
@@ -63,15 +63,31 @@ def _bounds():
     return b
 
 
-def plan(cur, waypoints, speed_dps=20.0, hz=15.0):
-    """현재 자세 → 웨이포인트 열 통과 틱 목록. 구간 등속·전역 s-curve."""
+def plan(cur, waypoints, speed_dps=20.0, hz=15.0, speeds=None):
+    """현재 자세 → 웨이포인트 열 통과 틱 목록. 구간 등속·전역 s-curve.
+
+    speeds: 웨이포인트별 구간 속도[°/s] 목록 (없으면 speed_dps 균일).
+    저공(책상 근처) 구간만 늦추는 용도 (2026-08-25 elbow 접촉 트립).
+    """
     pts = [{j: float(cur[j]) for j in J5}]
     for w in waypoints:
         pts.append({j: float(w[j]) for j in J5})
     if len(pts) < 2:                    # 이미 목표 자세 — 현자세 한 틱 (빈 min 방지)
         return [dict(pts[0])]
-    seg = [max(max(abs(b[j] - a[j]) for j in J5) / speed_dps, 1e-3)
-           for a, b in zip(pts, pts[1:])]
+    # ★ 팬 잠금 반영 (2026-08-26): 잠금 중에는 서버가 pan 명령을 덮어쓰므로,
+    # 계획에도 잠긴 각도를 넣어야 한다. 안 그러면 목표와 실제가 영원히 어긋나
+    # "수렴 정체" 로 오판한다(실측: 17.9° 남음).
+    try:
+        lk = _state().get('pan_lock')
+    except Exception:
+        lk = None
+    if lk is not None:
+        for q in pts:
+            q['shoulder_pan'] = float(lk)
+    if speeds is None:
+        speeds = [speed_dps] * (len(pts) - 1)
+    seg = [max(max(abs(b[j] - a[j]) for j in J5) / max(sp, 1.0), 1e-3)
+           for (a, b), sp in zip(zip(pts, pts[1:]), speeds)]
     T = sum(seg)
     n = max(2, int(T * hz))
     bnd = _bounds()
@@ -108,6 +124,7 @@ def stream(ticks, hz=15.0, z_floor=None):
     """
     period = 1.0 / hz
     gate_t = 0.0
+    prev_pos = None
     # 무제한 전환을 **확인하고** 출발한다 (2026-08-25 파킹 지연 33° 트립 원인:
     # 전환이 안 먹었는데 빠른 궤적을 흘리면 상한과의 격차가 지연으로 쌓인다).
     try:
@@ -139,9 +156,19 @@ def stream(ticks, hz=15.0, z_floor=None):
                     raise RuntimeError('이동 중 토크 낙하')
                 pos = s.get('pos') or {}
                 if all(j in pos for j in J5):
-                    gap = max(abs(pos[j] - tk[j]) for j in J5)
-                    if gap > 25.0:
-                        raise RuntimeError(f'추종 지연 {gap:.0f}° — 걸림 의심')
+                    lagj = max(J5, key=lambda j: abs(pos[j] - tk[j]))
+                    gap = abs(pos[lagj] - tk[lagj])
+                    # ★ 지연만으로 걸림이라 단정하지 않는다 (2026-08-26 오탐):
+                    # shoulder_lift 는 팔 전체를 중력에 맞서 드는 관절이라 명령
+                    # 궤적보다 뒤처지는 게 정상이다. **뒤처지면서 동시에 안 움직일
+                    # 때만** 진짜 걸림이다. 움직이고 있으면 궤적이 기다려 준다.
+                    moved = (prev_pos is None or
+                             abs(pos[lagj] - prev_pos.get(lagj, pos[lagj])) > 0.6)
+                    prev_pos = dict(pos)
+                    if gap > 25.0 and not moved:
+                        raise RuntimeError(f'추종 지연 {gap:.0f}° ({lagj}) · 정지 — 걸림')
+                    if gap > 70.0:      # 하드 상한 완화 — 중력 부하 구간의 정상 지연 (2026-08-26)
+                        raise RuntimeError(f'추종 지연 {gap:.0f}° ({lagj}) — 과대 이탈')
                     if z_floor is not None and fk_z(pos) < z_floor:
                         raise RuntimeError(
                             f'실측 z {fk_z(pos):+.3f} < 하한 {z_floor:+.3f}')
@@ -153,14 +180,29 @@ def stream(ticks, hz=15.0, z_floor=None):
             pass
         raise
     try:
+        # ★ 마무리: 목표를 계속 재전송하며 수렴을 기다린다 (2026-08-26).
+        # 종전에는 4.5초만 기다리고 **미도달이어도 성공으로 반환**해, 어깨가
+        # 22° 못 미친 자세를 "작업 자세 도달"로 보고했다. 중력 부하 관절은
+        # 명령 궤적이 끝난 뒤에도 몇 초 더 따라온다.
         tgt = ticks[-1]
-        for _ in range(15):                        # 수렴 대기 (P=32 면 금방)
+        last = None
+        for k in range(40):                        # 최대 20초
+            if k % 3 == 0:                         # 목표 재전송 (유실 대비)
+                try:
+                    _post('pose', joints={j: round(tgt[j], 2) for j in J5},
+                          timeout=2.0)
+                except Exception:
+                    pass
             pos = _state().get('pos') or {}
-            if all(j in pos for j in J5) and max(abs(pos[j] - tgt[j])
-                                                 for j in J5) < 2.5:
-                return pos
-            time.sleep(0.3)
-        return _state().get('pos')
+            if all(j in pos for j in J5):
+                gap = max(abs(pos[j] - tgt[j]) for j in J5)
+                if gap < 2.5:
+                    return pos
+                if last is not None and abs(gap - last) < 0.05 and k > 12:
+                    raise RuntimeError(f'수렴 정체 — 목표에서 {gap:.1f}° 남음')
+                last = gap
+            time.sleep(0.5)
+        raise RuntimeError(f'수렴 시간 초과 — 목표에서 {gap:.1f}° 남음')
     finally:
         try:
             _post('teleop_profile', on=False, timeout=10.0)

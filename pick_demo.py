@@ -43,7 +43,62 @@ GRIP_OPEN = {'standing': 45, 'lying': 45,
 APPROACH_CAND = (0.02, 0.005, -0.01)   # 접근 고도 후보 — 원거리 x 는 높은 z 가
 LIFT_CAND = (0.03, 0.015, 0.0)         # 안 풀린다(리치). IK 되는 첫 값을 쓴다
 GRIP_OPEN_ABS = 55          # 절대 개방각 — delta 방식은 이미 열린 상태에서 이중
-GRIP_CLOSE_ABS = 1          # 개방(99, 아랫턱 젖힘)을 만들었다(실측). 절대각으로만.
+GRIP_CLOSE_ABS = 7          # 개방(99, 아랫턱 젖힘)을 만들었다(실측). 절대각으로만.
+# ★ 1 → 7 (2026-08-26 사용자 "너무 세게 잡는다"): 파지력은 P 제어라 **목표까지
+# 남은 각도에 비례**한다. 큐브를 물면 ~11 에서 멈추는데 목표가 1 이면 10° 만큼
+# 계속 밀고, 7 이면 4° 만큼만 민다 — 힘이 절반 이하. 물체를 놓칠 위험은 죠
+# 예압이 남아 있어 낮고, 빈 죠 판정(2 부근)과도 여전히 구분된다.
+
+
+CSV_LOG = pathlib.Path('~/so101_datasets/pick_log.csv').expanduser()
+CSV_COLS = ['ts', 'repo', 'cycle', 'result', 'reason', 'pan_lock_deg',
+            'jitter_mm', 'iters', 'err_px', 'lateral_mm', 'roll_cmd_deg',
+            'obs_z', 'grasp_z', 'lift_z', 'grip_after', 'held', 'push_warn',
+            'place_r_mm', 'place_roll_deg']
+
+
+def csv_log(**kw):
+    """사이클 한 줄을 CSV 로 남긴다 (2026-08-26 사용자 지시) — 검산·오류 추적용.
+
+    실패해도 기록한다. 파일이 없으면 헤더를 먼저 쓴다. 어떤 예외도
+    수집을 방해하지 않도록 통째로 감싼다.
+    """
+    import csv as _csv
+    import datetime as _dt
+    try:
+        CSV_LOG.parent.mkdir(parents=True, exist_ok=True)
+        new = not CSV_LOG.exists()
+        row = {c: '' for c in CSV_COLS}
+        row['ts'] = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for k, v in kw.items():
+            if k in row:
+                row[k] = ('' if v is None else
+                          (f'{v:.2f}' if isinstance(v, float) else v))
+        with CSV_LOG.open('a', newline='', encoding='utf-8') as f:
+            w = _csv.DictWriter(f, fieldnames=CSV_COLS)
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except Exception:
+        pass
+
+
+def grip_close_ramp(target, steps=5, dt=0.19):   # 0.16→0.18→(5스텝·0.19: 추가 25% 감속, 2026-08-26)
+    """닫기 램프 (2026-08-25 사용자 지시 "닫는 속도 25% 감속") — 무제한 서보에
+    중간 목표를 시간 램프로 줘서 닫힘을 늦추고 균일화한다. 보호해제 선행 포함.
+    서보 상한 구조(22°/s 아니면 무제한, 중간 없음)라 궤적으로 감속한다."""
+    import time as _t
+    g = get('/state')['pos'].get('gripper', 50)
+    post('goto', joint='gripper', value=round(g, 1))       # 보호 해제
+    _t.sleep(0.15)
+    try:                                # 파지 힘 상한 낮추기 (살살 잡기)
+        post('grip_force', pct=45)
+    except Exception:
+        pass
+    for k in range(1, steps + 1):
+        post('goto', joint='gripper',
+             value=round(g + (target - g) * k / steps, 1))
+        _t.sleep(dt)
 # 죠 닫힘축 실측(2026-08-20, MuJoCo 두 손끝 사이트 — 실물 대조된 롤 오프셋
 # 반영): 닫힘축 yaw = pan + CLOSE_AXIS + roll [°]. 롤 0 에서 닫힘축은 방사
 # 방향과 거의 직교(-94.3)라 방사로 누운 물체가 잡혔다. 방향 파지는 물체
@@ -339,7 +394,7 @@ def main():
         except SystemExit:
             sys.exit('큐브 교시 오프셋이 없습니다 (이동 안 함) — 교시: 팔을 파지 '
                      '높이에 두고 큐브를 죠 바로 아래 중앙에 놓은 뒤 '
-                     'python3 ~/so101_tools/teach_cube_offset.py 실행')
+                     'python3 ~/so101-mobile-manipulation/teach_cube_offset.py 실행')
         x, y = loc[0] - C_OFF[0], loc[1] - C_OFF[1]
         # 방향은 깊이 점의 상대 상단 군집으로 (편향은 평행이동이라 각도 보존)
         # ★ 판정 실패 = 중단 (fail-closed). 4cm 큐브는 대각(45°)이면 대각선이
@@ -471,7 +526,7 @@ def main():
     g_now = get('/state')['pos'].get('gripper', 50)
     post('goto', joint='gripper', value=round(g_now, 1))  # 위치 재전송 = 과부하 보호 해제
     time.sleep(1.0)
-    post('goto', joint='gripper', value=GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS))
+    grip_close_ramp(GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS), steps=4, dt=0.14)
     wait_gripper_settle()
     # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신.
     # 전 포즈 공통으로 방위각∩평면 사용 (깊이 편향 면역).
@@ -497,7 +552,7 @@ def main():
     post('speed', pct=45)   # 최종 하강 — 접촉 정밀 구간이라 감속
     move_and_wait(x, y, z_grip, timeout=35.0, roll=roll)
     print('④ 파지')
-    post('goto', joint='gripper', value=GRIP_CLOSE_ABS)
+    grip_close_ramp(GRIP_CLOSE_ABS)
     g = wait_gripper_settle()
     if g is None:                      # 읽기 실패 — 압착 목표(1)를 남긴 채
         g = get('/state')['pos'].get('gripper')   # 진행하면 안 된다 (리뷰 M7)

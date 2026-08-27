@@ -36,6 +36,11 @@ import wrist_calib as wc                           # noqa: E402
 JOINTS6 = ['shoulder_pan', 'shoulder_lift', 'elbow_flex',
            'wrist_flex', 'wrist_roll', 'gripper']
 STEP_DEG = 6.0          # 스텝(0.1s)당 관절 이동 상한 — 60°/s
+# ★ 명령 저역통과 (2026-08-26): 정책 출력은 프레임마다 지터가 있는데, 서보 속도
+# 상한을 없앤 뒤로 팔이 그 지터를 그대로 재현해 **덜덜 떨며 큐브를 밀었다**(실측).
+# 예전엔 속도 상한이 필터 역할을 했다. 지수평활로 명령 자체를 매끄럽게 만든다.
+SMOOTH = 0.55           # 새 명령 비중 (1.0 = 필터 없음)
+POLICY_SPEED_PCT = 55   # 정책 실행 중 서보 속도 — 하드웨어 쪽 2차 필터
 FLOOR_MARGIN = 0.004    # 명령 자세 죠 끝 z 하한 = floor + 4mm (파지 9.4mm 아래)
 
 
@@ -152,6 +157,18 @@ def main():
           + (' · DRY(전송 안 함)' if a.dry else ''))
 
     import torch
+    # 정책 실행 중에는 속도 상한을 되살린다 (텔레옵 무제한 정책과 무관 —
+    # 여기서만 하드웨어 저역통과를 쓴다). 종료 시 원복.
+    # ★ 팬 제약 (2026-08-26 차량 장착): 학습된 정책은 shoulder_pan 도 명령하는데,
+    # 클램프 장착에서는 잠긴 각도 ±허용치를 넘으면 파손이다. 서버도 막지만,
+    # 클라이언트가 먼저 접어 보내야 정책이 벽을 밀며 싸우지 않는다.
+    PAN_LK = st.get('pan_lock')
+    PAN_TOL = float(st.get('pan_tol') or 0.0)
+    if PAN_LK is not None:
+        print(f'🔒 팬 제약 {PAN_LK:+.1f}° ± {PAN_TOL:.1f}° — 정책 명령을 접습니다')
+    prev_speed = int(st.get('speed_pct') or 50)
+    pd.post('speed', pct=POLICY_SPEED_PCT)
+    print(f'명령 평활 {SMOOTH:.2f} · 실행 속도 {POLICY_SPEED_PCT}%')
     period = 1.0 / a.fps
     t_end = time.monotonic() + a.seconds
     n = sent = frozen = 0
@@ -176,7 +193,13 @@ def main():
         for i, j in enumerate(JOINTS6):
             tgt = float(act[i])
             lo, hi = base[j] - STEP_DEG, base[j] + STEP_DEG
-            cmd[j] = max(lo, min(hi, tgt))
+            v = max(lo, min(hi, tgt))
+            if prev_cmd is not None:      # 지수평활 — 떨림 제거
+                v = SMOOTH * v + (1.0 - SMOOTH) * prev_cmd[j]
+            cmd[j] = v
+        if PAN_LK is not None:                    # 팬은 허용 범위로 접는다
+            cmd['shoulder_pan'] = min(max(cmd['shoulder_pan'],
+                                          PAN_LK - PAN_TOL), PAN_LK + PAN_TOL)
         # FK 바닥 가드 — 그리퍼 제외 5축으로 z 예측
         z = fk_z_of(cmd)
         if z < floor + FLOOR_MARGIN:
@@ -195,6 +218,7 @@ def main():
         prev_cmd = cmd
         time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
+    pd.post('speed', pct=prev_speed)          # 속도 원복
     print(f'종료 — 스텝 {n} · 전송 {sent} · z가드 동결 {frozen}')
     print('팔은 마지막 자세 유지(토크 ON). 파킹은 park.py 또는 panel_restart.sh')
 

@@ -1,7 +1,21 @@
 __pycache__/
 *.pyc
 *.log
+.pytest_cache/
 .omc/
 calib_backup_*.json
 _range_tmp.json
 handeye_invalid_*.json
+handeye_last_obs.json
+
+# 실험·게시 산출물은 로컬에 보관하고 Git에는 넣지 않는다.
+media/
+cafe/
+*.mp4
+*.gif
+*.png
+*.jpg
+
+# 런타임 상태와 외부 MuJoCo 메시 링크
+rec_pids.txt
+sim/meshes

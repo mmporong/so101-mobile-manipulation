@@ -17,9 +17,9 @@ STS3215는 Protection_Current=0(과전류 보호 꺼짐), Unloading_Condition=0(
 2026-08-19 wrist_flex 발연이 그 상태에서 났다. ID를 바꾸는 김에 같이 켠다.
 
 사용:
-    python3 ~/so101_tools/servo_id.py --to 4              # 찾은 서보를 ID 4 로
-    python3 ~/so101_tools/servo_id.py --to 4 --port /dev/ttyACM0
-    python3 ~/so101_tools/servo_id.py --check             # 바꾸지 않고 보기만
+    python3 ~/so101-mobile-manipulation/servo_id.py --to 4  # 찾은 서보를 ID 4 로
+    python3 ~/so101-mobile-manipulation/servo_id.py --to 4 --port /dev/ttyACM0
+    python3 ~/so101-mobile-manipulation/servo_id.py --check # 바꾸지 않고 보기만
 """
 import argparse
 import sys

@@ -9,7 +9,7 @@
 #   3) 패널 자체의 flock 단일 인스턴스 잠금이 최후 방어선.
 #   4) 팔 안전: 종료는 토크 유지 경로라 팔은 자세를 지킨다. 파킹은 토크 ON
 #      + 패널 응답일 때만 시도하고, 실패해도 재시작은 계속한다(토크 유지 전제).
-# 사용: bash ~/so101_tools/panel_restart.sh [--no-park]
+# 사용: bash ~/so101-mobile-manipulation/panel_restart.sh [--no-park]
 set -u
 PY="$HOME/miniforge3/envs/lerobot/bin/python"
 API="http://127.0.0.1:8765"
@@ -28,7 +28,7 @@ echo "── 1/4 파킹 시도"
 if [ "${1:-}" != "--no-park" ]; then
     st=$(curl -s -m 5 "$API/state" 2>/dev/null || true)
     if echo "$st" | grep -q '"connected": true' && echo "$st" | grep -q '"torque": true'; then
-        timeout 420 "$PY" "$HOME/so101_tools/park.py" \
+        timeout 420 "$PY" "$HOME/so101-mobile-manipulation/park.py" \
             || echo "   ⚠ 파킹 실패 — 토크 유지 종료로 계속 (팔은 자세를 지킴)"
     else
         echo "   토크 OFF/미연결 — 파킹 생략"
@@ -64,7 +64,7 @@ echo "   포트 해제 확인"
 
 echo "── 3/4 기동 (정확히 1개)"
 cd "$DIR" || exit 1
-nohup "$PY" -u panel_server.py > panel_server.log 2>&1 &
+setsid nohup "$PY" -u panel_server.py > panel_server.log 2>&1 < /dev/null &   # 세션 분리 — Claude 세션이 죽어도 패널 유지 (2026-08-26)
 NEW=$!
 sleep 16
 ps -p "$NEW" >/dev/null 2>&1 || { echo "⚠ 기동 실패"; tail -5 panel_server.log; exit 1; }

@@ -44,6 +44,8 @@ HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import arm_lib                                    # noqa: E402
 OUT = HERE / 'handeye.json'
+GAIN = HERE / 'servo_gain.json'
+OBS_OUT = HERE / 'handeye_last_obs.json'
 
 # 작업 영역 안에서 세 축을 모두 흔든 격자. z 를 **세 층**으로 둬 평면 퇴화를 막는다.
 #
@@ -556,7 +558,7 @@ def main():
         # ★ 실패해도 **관측은 남긴다** (2026-08-21). 순회 한 번이 4~5분인데
         # 게이트에 걸릴 때마다 데이터를 버리면 원인 분석을 하려고 팔을 또
         # 돌려야 한다. 정합값이 아니라 원자료라 handeye.json 을 오염시키지 않는다.
-        obs_p = HERE / 'handeye_last_obs.json'
+        obs_p = OBS_OUT
         try:
             obs_p.write_text(json.dumps({
                 'note': ('게이트 미달로 채택되지 않은 순회의 원자료. 정합값이 '
@@ -603,7 +605,7 @@ def main():
     # 재정합은 교시 상수(파지 오프셋·손목캠 목표 픽셀)의 기준을 갈아치운다 —
     # 재교시 전에는 못 쓰게 stale 마킹 (14차 리뷰 M3). 소비자(pick_demo 등)는
     # arm_lib.load_gain(필수키) 로 로드하므로 여기서 스스로 멈춘다.
-    gain_p = HERE / 'servo_gain.json'
+    gain_p = GAIN
     try:
         gain = json.loads(gain_p.read_text())
         grp = gain.setdefault('stale_after_rereg', {})

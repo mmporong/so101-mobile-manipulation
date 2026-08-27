@@ -173,11 +173,26 @@ def run_case(arm, torque_kill_at=None):
     import floor_from_depth as ffd
     handeye.BASE = f'http://127.0.0.1:{PORT}'
     ffd.DAEMON = f'http://127.0.0.1:{PLANE_PORT}'
-    handeye.OUT = pathlib.Path(tempfile.mkdtemp()) / 'handeye.json'
+    case_dir = pathlib.Path(tempfile.mkdtemp())
+    handeye.OUT = case_dir / 'handeye.json'
+    # 정합 성공 시 교시값을 stale 표시하는 동작도 임시 파일에 격리한다.
+    # 실제 servo_gain.json을 건드리면 오프라인 테스트가 실측 설정을 오염시킨다.
+    handeye.GAIN = case_dir / 'servo_gain.json'
+    handeye.OBS_OUT = case_dir / 'handeye_last_obs.json'
+    handeye.GAIN.write_text(json.dumps({
+        # 가짜 책상 평면과 같은 기준을 주입한다. 제품의 차량 바닥값이 섞이면
+        # 방위각+평면 솔버만 다른 좌표계를 풀어 교차검증이 무의미해진다.
+        'floor_z_m': FLOOR,
+        'grasp_xy_offset_m': [0.0, 0.0],
+        'wrist_grasp_target_px': [160.0, 120.0],
+    }))
+    arm_lib.GAIN = handeye.GAIN
+    ffd.GAIN = handeye.GAIN
     if arm.stall:
         orig = handeye.wait_reached
         handeye.wait_reached = lambda q, m, **kw: orig(q, m, timeout=2.0)
-    sys.argv = ['handeye.py']
+    # 가짜 팔은 즉시 목표에 도달하므로 실물 안정 대기 시간은 필요 없다.
+    sys.argv = ['handeye.py', '--settle', '0']
     code = None
     try:
         handeye.main()

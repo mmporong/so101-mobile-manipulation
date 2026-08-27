@@ -1,0 +1,44 @@
+{
+  "note": "차량 장착 안전 가동 범위 — 사람이 손으로 훑어 기록 (2026-08-27). 충돌 기준이며 전기적 한계와는 다르다.",
+  "source": "record_range.py 실행 화면 실측값 (도구 종료 전 파일 미저장 → 수기 반영)",
+  "joints": {
+    "shoulder_pan": {
+      "min": -24.3,
+      "max": -6.9,
+      "span": 17.4,
+      "status": "ok"
+    },
+    "shoulder_lift": {
+      "min": -113.1,
+      "max": 113.8,
+      "span": 226.9,
+      "status": "ok"
+    },
+    "elbow_flex": {
+      "min": -98.4,
+      "max": 99.3,
+      "span": 197.7,
+      "status": "ok"
+    },
+    "wrist_flex": {
+      "min": -105.7,
+      "max": 100.7,
+      "span": 206.4,
+      "status": "ok"
+    },
+    "wrist_roll": {
+      "min": -169.8,
+      "max": 177.3,
+      "span": 347.1,
+      "status": "ok"
+    },
+    "gripper": {
+      "min": 0.0,
+      "max": 100.0,
+      "span": 100.0,
+      "status": "ok"
+    }
+  },
+  "pan_lock_tol_deg": 7.0,
+  "pan_lock_tol_note": "2026-08-27 충돌 직전 실측 반폭 8.7°에서 1.7° 여유를 둔 현재 배치값. 반지름 190mm에서 좌우 작업폭은 약 ±23mm다."
+}

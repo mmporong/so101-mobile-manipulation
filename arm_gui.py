@@ -8,7 +8,7 @@ CLI 세 단계(lerobot-calibrate → jog_test → ik_verify)를 버튼으로 옮
 
 사용:
     conda activate lerobot
-    python3 ~/so101_tools/arm_gui.py            # 기본 /dev/ttyACM0, id=follower
+    python3 ~/so101-mobile-manipulation/arm_gui.py  # 기본 /dev/ttyACM0, id=follower
 
 절차 (왼쪽부터 순서대로):
     ① 연결 → 관절 표에 현재 각도가 흐르면 통신 OK
@@ -124,7 +124,8 @@ class Worker(threading.Thread):
         self.lock = threading.Lock()
         self.state = {'connected': False, 'calibrated': False, 'torque': False,
                       'recording': False, 'pos': {}, 'range': {}, 'log': [],
-                      'speed_pct': 50, 'cam': None, 'teleop': False}
+                      'speed_pct': 50, 'cam': None, 'teleop': False,
+                      'pan_lock': None, 'pan_tol': 0.0}
         self.bus = None
         self._stop = False
         # 정지 신호 — HTTP 스레드가 큐를 우회해 직접 올린다. 워커가 3초 보간
@@ -293,10 +294,16 @@ class Worker(threading.Thread):
         # 충돌 시 미는 힘은 Torque_Limit 600 이, 소손은 과전류 컷이 막는다.
         # _profile_vel() 은 보간 시간·스톨 판정 계산용으로만 남는다.
         self.bus.sync_write('Goal_Velocity', {m: 0 for m in ALL}, normalize=False)
-        # 가속 8(×100 스텝/s²): 15 는 구간마다 급출발·급정지로 삐걱였다
-        # (2026-08-20 사용자 체감) — 램프를 ~2배 완만하게.
-        self.bus.sync_write('Acceleration', {m: 8 for m in ALL}, normalize=False)
-        self.bus.sync_write('Torque_Limit', {m: 600 for m in ALL}, normalize=False)
+        # 가속 30(×8.7°/s²≈260°/s²): 8 은 빠른 보간(25°/s+)을 못 따라가
+        # 추종 오차 ~20° 가짜 스톨을 만들었다(2026-08-25). 부드러움은 이제
+        # 궤적(스무스텝 보간·스트리밍)이 만든다 — 램프는 추종만 방해하지 않게.
+        self.bus.sync_write('Acceleration', {m: 30 for m in ALL}, normalize=False)
+        # 팔 관절 힘 상한 600→800 (2026-08-26 차량 장착): 팔이 더 깊이 뻗어
+        # 중력 토크가 커졌고, 60% 로는 손목이 명령 속도를 못 따라가 스톨 오판이
+        # 났다. 소손은 과전류 컷(320)이 별도로 막는다. 그리퍼는 grip_force 값 유지.
+        # ★ 상한 해제 1000(100%) — 2026-08-26 사용자 지시 "더 들 수 있잖아".
+        # 소손은 과전류 컷(320)이 계속 막는다. 그리퍼는 grip_force 값 유지.
+        self.bus.sync_write('Torque_Limit', {m: 1000 for m in ARM}, normalize=False)
 
     def _profile_vel(self):
         """speed_pct → Goal_Velocity 유닛. 1%→17(≈1.5°/s) · 100%→254(≈22°/s).
@@ -365,11 +372,70 @@ class Worker(threading.Thread):
                 bad.append(m)
         return bad
 
+    def _do_pan_lock(self, on, tol=0.0, center=None):
+        """shoulder_pan 을 현재 각도에 **잠근다** (2026-08-26 차량 장착).
+
+        팔이 차체 상판에 C클램프로만 물려 있어 팬 회전은 클램프를 비틀어
+        **즉시 파손**된다. 클라이언트를 믿지 않고 서버에서 막는다 — 잠긴 뒤
+        pan 을 바꾸는 모든 명령(goto·pose·move_q)은 현재 각도로 강제된다.
+        """
+        st = self.snapshot()
+        if on:
+            cur = (center if center is not None
+                   else (st.get('pos') or {}).get('shoulder_pan'))
+            # center 를 주면 그 각도를 중심으로 잠근다 — 실측 안전 범위의
+            # 중점을 쓰면 좌우 여유가 대칭이 된다 (2026-08-27 팬 실측 -24.3~-6.9).
+            if cur is None:
+                self.say('⚠ 팬 잠금 실패 — 현재 각도를 못 읽었습니다')
+                return
+            with self.lock:
+                self.state['pan_lock'] = float(cur)
+                self.state['pan_tol'] = max(0.0, float(tol))
+            self.say(f'🔒 팬 잠금 {cur:+.1f}° ± {float(tol):.1f}° — '
+                     f'범위 밖 좌우 회전은 막습니다')
+        else:
+            with self.lock:
+                self.state['pan_lock'] = None
+                self.state['pan_tol'] = 0.0
+            self.say('팬 잠금 해제')
+
+    def _pan_fix(self, goals):
+        """잠금 중이면 pan 목표를 잠긴 각도로 덮는다. (dict in-place)"""
+        st = self.snapshot()
+        lk = st.get('pan_lock')
+        if lk is None or 'shoulder_pan' not in goals:
+            return goals
+        # ★ 허용 범위 (2026-08-26 사용자 "ㄷ자 자세에서는 조금 움직여도 된다"):
+        # 완전 고정 대신 잠긴 각도 ±tol 로 클램프한다. 그 안에서는 IBVS 가
+        # 좌우 오차를 스스로 보정하고, 범위를 넘는 명령만 잘라낸다.
+        tol = float(st.get('pan_tol') or 0.0)
+        v = float(goals['shoulder_pan'])
+        lo, hi = lk - tol, lk + tol
+        if v < lo - 0.3 or v > hi + 0.3:
+            self.say(f'🔒 팬 범위 클램프 {v:+.1f}° → [{lo:+.1f},{hi:+.1f}]')
+        goals['shoulder_pan'] = min(max(v, lo), hi)
+        return goals
+
+    def _do_grip_force(self, pct):
+        """그리퍼 파지력 상한만 조정 (2026-08-26 "살살 잡아").
+
+        Torque_Limit 은 서보가 막혔을 때 밀어붙이는 힘의 상한이다. 팔 관절은
+        그대로 두고 그리퍼만 낮춰 큐브를 덜 조이게 한다. 100% = 1000.
+        """
+        if not self.snapshot()['connected']:
+            return
+        v = max(10, min(100, int(pct))) * 10
+        try:
+            self.bus.write('Torque_Limit', 'gripper', v, normalize=False)
+            self.say(f'그리퍼 파지력 {pct}% (Torque_Limit {v})')
+        except Exception as e:
+            self.say(f'⚠ 파지력 설정 실패: {type(e).__name__}')
+
     def _do_speed(self, pct):
-        # ★ 전역 +50% (2026-08-25 사용자 지시 "전체 동작속도 50% 올려") —
-        # 스크립트들이 요청하는 pct 를 한 지점에서 증폭한다. 상한 100%(≈22°/s,
-        # Maximum_Velocity_Limit 254 가 물리 한계)는 그대로다.
-        pct = max(5, min(100, int(int(pct) * 1.5)))
+        # ★ 전역 배율 (2026-08-26 차량 장착 후 "전체 50% 감속"): 팔이 클램프로만
+        # 물려 있어 관성이 곧 위험이다. 종전 1.5배 증폭을 0.75배로 낮춘다
+        # (스크립트 요청 대비 절반).
+        pct = max(5, min(100, int(int(pct) * 0.75)))
         with self.lock:
             self.state['speed_pct'] = pct
         if self.snapshot().get('teleop'):
@@ -648,6 +714,14 @@ class Worker(threading.Thread):
             return
         # ★ 슬라이더도 캘리브 범위를 넘으면 막는다. 여기는 목표만 쓰고 반환해서
         # 이동 감시가 없다 — 범위 밖으로 보내면 아무도 못 잡는 스톨이 된다.
+        if joint == 'shoulder_pan':
+            _st = self.snapshot()
+            lk = _st.get('pan_lock')
+            tol = float(_st.get('pan_tol') or 0.0)
+            if lk is not None and abs(float(value) - lk) > tol + 0.3:
+                self.say(f'🔒 팬 범위 밖 — goto {value:+.1f}° 거부 '
+                         f'(허용 {lk:+.1f}±{tol:.1f}°)')
+                return
         if joint in ARM:
             why, _bad = self._clamp_to_calib({joint: float(value)})
             if why:
@@ -683,6 +757,7 @@ class Worker(threading.Thread):
                 self.say(f'⛔ pose 거부 — gripper {gv:.1f} 가 0~100 밖')
                 return
             goals['gripper'] = gv
+        goals = self._pan_fix(goals)
         if goals:
             self.bus.sync_write('Goal_Position', goals)
             # ★ 기록 신선도 (2026-08-24): 텔레옵 스트림은 큐를 계속 채워 _poll 이
@@ -741,9 +816,6 @@ class Worker(threading.Thread):
             raw = self.bus.sync_read('Present_Position', normalize=False)
             self.bus.sync_write('Goal_Position', {m: raw[m] for m in ARM},
                                 normalize=False)
-            if not self.snapshot().get('teleop'):
-                self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL},
-                                    normalize=False)
             self.say(f'⛔ {why} — 정지·자세 유지(토크 ON). 확인 후 재시도하세요')
         except Exception:
             self._kill_torque(f'{why} + 유지 쓰기 실패')
@@ -761,23 +833,19 @@ class Worker(threading.Thread):
             raw = self.bus.sync_read('Present_Position', normalize=False)
             self.bus.sync_write('Goal_Position', {m: raw[m] for m in ARM},
                                 normalize=False)
-            # 남은 명령이 있어도 다음 이동이 기어가도록 속도를 바닥으로 내린다.
-            # ★ 복원 책임: _do_move_q 가 이동 시작 전 _restore_velocity() 를
-            # 부른다(감사 C1 — 복원 없이 이동하면 스톨 감지의 win_cap 이 프로파일
-            # 기준이라 정상 이동을 1~2초 만에 오탐 킬한다).
-            # 텔레옵 중엔 속도 바닥 내리기 생략 — 목표=현재 재기록만으로 서고,
-            # 8 이 남으면 리더 추종이 0.7°/s 로 기어 "한 관절만 느림"이 재발한다.
-            if not self.snapshot().get('teleop'):
-                self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL},
-                                    normalize=False)
+            # ★ 속도 바닥 내리기 **완전 제거** (2026-08-26): 8(0.7°/s)이 남은 채
+            # 다음 이동이 시작되면 전 관절이 기어가고, 이동량이 가장 큰 관절이
+            # 크게 뒤처져 스톨로 오판된다(차량에서 wrist_flex 16° 뒤처짐 반복,
+            # 실제 원인은 이 잔재였다). 정지 목적은 목표=현재 재기록으로 이미
+            # 달성되고, 속도 상한은 애초에 없애기로 한 정책이다.
         self.say('⏹ 정지 — 현재 자세 유지')
 
     def _restore_velocity(self):
-        """Goal_Velocity 만 프로파일 값으로 복원 — _do_stop 이 8 로 내린 것.
+        """이동 전에 Goal_Velocity 무제한 정책을 다시 적용한다.
 
-        _apply_motion_profile 을 쓰지 않는 이유: 그쪽은 Torque_Limit 600 도 함께
-        재기록하는데, 눌렸을 수 있는 상태에서 힘 한도를 올리면 안 된다
-        (probe_floor 1차 실행의 교훈 — finally 원복이 더 세게 밀었다)."""
+        정지 경로는 속도를 바꾸지 않지만, 외부 텔레옵이나 과거 명령이 남겼을
+        수 있는 낮은 상한을 이동 직전에 제거한다. _apply_motion_profile 전체를
+        쓰면 힘·가속도까지 건드리므로 Goal_Velocity만 재기록한다."""
         # 상한 제거 정책과 일치 — 복원도 무제한 (0)
         self.bus.sync_write('Goal_Velocity', {m: 0 for m in ALL}, normalize=False)
 
@@ -929,9 +997,7 @@ class Worker(threading.Thread):
                             self.bus.sync_write('Goal_Position',
                                                 {m: raw[m] for m in ARM},
                                                 normalize=False)
-                            self.bus.sync_write('Goal_Velocity',
-                                                {m: 8 for m in ALL},
-                                                normalize=False)
+                            # 속도 바닥 내리기 제거 (2026-08-26) — 위 주석 참조
                             self.say(f'⛔ 스톨 — {worst} 가 보간 목표에서 '
                                      f'{lag[worst]:.1f}° 뒤처짐. 정지·자세 유지'
                                      f'(토크 ON). 간섭 확인 후 재시도하세요')
@@ -1025,6 +1091,7 @@ class Worker(threading.Thread):
         mapping = arm_lib.load_mapping()
         target = {j: mapping['signs'][j] * math.degrees(q_rad[i])
                   + mapping['offsets'][j] for i, j in enumerate(ARM)}
+        target = self._pan_fix(target)          # 🔒 차량 장착 시 좌우 회전 금지
         cur = self.bus.sync_read('Present_Position', ARM)
 
         # ── wrist_roll 은 ±180 이 같은 자세다. 목표를 현재 위치에 가장 가까운 등가
@@ -1055,9 +1122,9 @@ class Worker(threading.Thread):
                      f' 범위가 더 좁습니다')
             return
 
-        # ★ 속도 복원 — 직전에 stop 이 있었으면 상한이 8(≈0.7°/s)로 내려가 있다.
-        # 복원 없이 이동하면 스톨 감지 기준(win_cap)과 실제 상한이 어긋나 정상
-        # 이동이 오탐 킬로 끝난다(감사 C1: 관측 실패 → stop → 다음 지점 낙하).
+        # ★ 속도 정책 재적용 — stop은 상한을 바꾸지 않지만 외부 텔레옵이나 과거
+        # 명령이 남긴 저속 상한이 있을 수 있다. 이동 직전에 무제한(0)을 다시 써
+        # 실제 속도 정책과 스톨 감지 기준이 어긋나지 않게 한다.
         try:
             self._restore_velocity()
         except Exception:
