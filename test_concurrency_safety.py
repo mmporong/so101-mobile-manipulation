@@ -72,6 +72,9 @@ class Bus:
 def worker():
     w = Worker('/dev/fake', 'follower', base_interlock_provider=lambda: {
         'active': True, 'reason': 'stationary', 'expires_at': 1e12})
+    # 동시성 계약은 저장소 밖 ROS FK가 아니라 명령 epoch·STOP 상태 전이를 본다.
+    # rearm의 기하 입력은 안전한 결정론적 fixture로 고정한다.
+    w._tcp_z = lambda _servo: 0.0
     w.bus = Bus()
     w._calib_cache = {m: {'range_min': 0, 'range_max': 4095} for m in ALL}
     w.state.update(connected=True, calibrated=True, torque=True,
@@ -471,6 +474,9 @@ def test_worker_camera_dirty_direct_and_queued_toctou_write_zero():
 
     w = worker()
     packet = _camera_packet(w)
+    # queued command의 TOCTOU 차단만 검증한다. 주기 telemetry poll이
+    # command I/O assertion과 경쟁하지 않도록 이 테스트에서는 격리한다.
+    w._poll = lambda: None
     command_id = w.submit('cam_move', 'pan', 1.0)
     # enqueue 뒤 execution 전에 dirty가 생기는 hostile 순서.
     w.state['maintenance_dirty'] = True
