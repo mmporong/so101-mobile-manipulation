@@ -76,12 +76,15 @@ class StopBus:
         return 0
 
 
-def assert_stop_hold_writes(writes):
+def assert_stop_hold_writes(writes, current=None):
     assert len(writes) == 2, writes
     assert [(name, normalize) for name, _values, normalize in writes] == [
         ('Goal_Position', False), ('Goal_Position', False)]
     assert [set(values) for _name, values, _normalize in writes] == [
         set(ARM), {'gripper'}]
+    if current is not None:
+        assert writes[0][1] == {motor: int(current[motor]) for motor in ARM}
+        assert writes[1][1] == {'gripper': int(current['gripper'])}
 
 
 def main():
@@ -213,13 +216,20 @@ def main():
     moving = Worker('/dev/fake', 'follower',
                     base_interlock_provider=expiring_provider)
     moving.bus = StopBus()
+    # 이 테스트는 lease 상실과 STOP 경계가 대상이다. 실기 workspace 밖의 FK가
+    # 없는 CI에서도 무관한 floor gate가 먼저 끝내지 않도록 기하 판정은 격리한다.
+    moving._swept_floor_reason = lambda *_args, **_kwargs: None
     moving.state.update(connected=True, calibrated=True, torque=True, torque_state='on',
                         safety_ready=True,
                         pan_lock=-15.6, pan_tol=7.0)
     cur = {j: 0.0 for j in ARM}; cur['shoulder_pan'] = -15.6
     target = {j: cur[j] + 1.0 for j in ARM}
     assert moving._interp(cur, target, 0.2) is False
-    assert '보간 중 안전 invariant 상실' in moving.snapshot()['log'][-1]
+    logs = moving.snapshot()['log']
+    assert any('보간 중 안전 invariant 상실 — 베이스 인터록: fake lease 만료'
+               in line for line in logs), logs
+    assert moving._base_stop_latched is True
+    assert_stop_hold_writes(moving.bus.writes[-2:], moving.bus.raw)
 
     # 일부 통전·read-back unknown도 off로 간주하지 않고 정지·telemetry 감시한다.
     for torque_state in ('mixed', 'unknown'):

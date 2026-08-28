@@ -264,6 +264,9 @@ class UncloseableEnergizedBus(SilentFailedGripperBus):
 def worker(bus=None, port='/dev/fake'):
     w = Worker(port, 'follower', base_interlock_provider=lambda: {
         'active': True, 'reason': 'stationary', 'expires_at': 1e12})
+    # P0 단위 테스트는 저장소 밖 ROS workspace의 FK에 기대지 않는다. 실제 경로의
+    # 내부 최저점 검증은 test_swept_floor_counterexample에서 별도 fixture로 덮는다.
+    w._tcp_z = lambda _servo: 0.0
     w.bus = bus or Bus()
     w._device_authority = TestDeviceAuthority(port)
     w._device_authority.bind_bus(w.bus)
@@ -1176,14 +1179,32 @@ def test_swept_floor_counterexample():
     tgt_v = [-15.6, 95.160213, 57.292129, -43.318989, -141.894765]
     cur = dict(zip(ARM, cur_v)); target = dict(zip(ARM, tgt_v))
     w = worker()
+
+    # 양 끝보다 내부가 더 낮은 궤적을 만드는 결정론적 FK fixture. 이 테스트가
+    # 검증하는 것은 endpoint가 아니라 보간 경로 전체를 훑어 거부하는 계약이다.
+    lift_start = cur['shoulder_lift']
+    lift_span = target['shoulder_lift'] - lift_start
+
+    def swept_floor_fixture(servo):
+        t = (servo['shoulder_lift'] - lift_start) / lift_span
+        assert set(servo) == set(ARM)
+        for joint in ARM:
+            expected = cur[joint] + (target[joint] - cur[joint]) * t
+            assert abs(servo[joint] - expected) < 1e-9, (joint, servo[joint], expected)
+        return 0.790079654941623 * t * t - 1.17947965494162 * t + 0.1861
+
+    w._tcp_z = swept_floor_fixture
     samples = w._trajectory_floor_samples(cur, target, steps=200)
     assert abs(samples[0] - 0.1861) < 0.001
     assert abs(samples[-1] - (-0.2033)) < 0.001
     assert abs(min(samples) - (-0.2541)) < 0.001
     assert min(samples) < -0.238
+    reason = w._swept_floor_reason(cur, target, steps=200)
+    assert reason == '궤적 TCP 최저 z=-0.254m가 floor 안전여유 아래', reason
     before = len(w.bus.writes)
     assert w._interp(cur, target, 0.2) is False
     assert len(w.bus.writes) == before, '위험 궤적이 한 tick이라도 쓰임'
+    assert w.snapshot()['log'][-1] == f'⛔ {reason}'
 
 
 def test_guard_and_current_read_fail_closed():
