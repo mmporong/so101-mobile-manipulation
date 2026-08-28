@@ -75,7 +75,13 @@ python3 "$HOME/so101-mobile-manipulation/wrist_yolo.py" \
 
 주행 중에는 차량만 움직이고 팔은 관찰 자세로 고정합니다. 파지는 반드시
 `cmd_vel=0`과 오도메트리 정지를 확인한 뒤 시작하며, 팔이 동작하는 동안 베이스
-명령 소유권을 잠그는 상태머신을 다음 통합 단계에서 연결합니다.
+상태를 짧은 lease로 확인합니다. `ros_base_monitor.py`가 `/cmd_vel`·`/odom`·ROS
+graph를 함께 읽고, Worker는 이 lease가 유효할 때만 팔 명령을 허용합니다. 공개
+[`robot-dashboard`](https://github.com/mmporong/robot-dashboard/tree/feat/so101-arm/projects/so101-arm)
+패널이 모니터의 시작과 종료를 관리합니다. 공개
+[GitHub Actions](https://github.com/mmporong/robot-dashboard/actions/runs/33138872279)에서
+대시보드 단위 27항목과 공개 정본 통합 28항목이 통과했습니다. 이는 코드와 수명주기
+연결을 검증한 결과이며, 차량 반복 파지는 아직 실물 HIL 결과를 남기지 않았습니다.
 
 ## 개발 환경
 
