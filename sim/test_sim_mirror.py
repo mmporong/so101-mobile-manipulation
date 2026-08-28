@@ -18,6 +18,8 @@ import arm_lib                                              # noqa: E402
 import mirror_daemon                                        # noqa: E402
 import sim_core                                             # noqa: E402
 
+CONTRACT_SCENE = D / 'scene_mirror_contract.xml'
+
 
 def panel_pos(sim, world):
     """MuJoCo 월드 좌표를 pan 축 기준 좌표로 되돌린다."""
@@ -29,7 +31,7 @@ def close(a, b, eps=1e-6):
 
 
 def main():
-    sim = sim_core.SimMirror(piece='cube')
+    sim = sim_core.SimMirror(piece='cube', scene_path=CONTRACT_SCENE)
     floor = sim.floor
     assert close(floor, -0.238), f'차량 작업면 높이 불일치: {floor}'
     sim._prev_g = None
@@ -78,7 +80,8 @@ def main():
     print(f'  방출 후 큐브 중심 z={released[2]:+.3f}m: OK')
 
     print('⑤ 미러 데몬 수동 배치 API 코어')
-    rd = mirror_daemon.Renderer(piece='cube', width=64, height=64)
+    rd = mirror_daemon.Renderer(
+        piece='cube', width=64, height=64, scene_path=CONTRACT_SCENE)
     rd.place_piece(0.21, 0.01, 15.0)
     assert rd.piece_xy == (0.21, 0.01) and rd.piece_yaw == 15.0
     daemon_piece = panel_pos(rd.sim,

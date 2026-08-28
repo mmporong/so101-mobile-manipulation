@@ -87,10 +87,11 @@ def load_frame():
 class SimMirror:
     """MJCF 씬 하나를 들고 자세·물체를 반영하며, 원하면 오프스크린 렌더한다."""
 
-    def __init__(self, piece='cube', width=640, height=480):
+    def __init__(self, piece='cube', width=640, height=480, scene_path=None):
         import mujoco
         self.mj = mujoco
-        self.model = mujoco.MjModel.from_xml_path(str(D / 'scene_mirror.xml'))
+        self.scene_path = pathlib.Path(scene_path or D / 'scene_mirror.xml')
+        self.model = mujoco.MjModel.from_xml_path(str(self.scene_path))
         apply_vehicle_geometry(self.model, mujoco)
         self.data = mujoco.MjData(self.model)
         self.R, self.t = load_frame()

@@ -47,9 +47,10 @@ def _get(url, timeout=2.0):
 
 
 class Renderer(threading.Thread):
-    def __init__(self, piece='cube', width=640, height=480):
+    def __init__(self, piece='cube', width=640, height=480, scene_path=None):
         super().__init__(daemon=True)
-        self.sim = sim_core.SimMirror(piece=piece, width=width, height=height)
+        self.sim = sim_core.SimMirror(
+            piece=piece, width=width, height=height, scene_path=scene_path)
         self.lock = threading.Lock()
         self.jpeg = None
         self.seq = 0

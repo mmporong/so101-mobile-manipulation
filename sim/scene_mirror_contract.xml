@@ -1,0 +1,62 @@
+<mujoco model="so101_mirror_contract">
+  <!-- 공개 CI 전용 프록시다. 관절·사이트·차량 배치 계약만 검증하며,
+       실물 형상이나 렌더 증거에는 사용하지 않는다. -->
+  <option gravity="0 0 0"/>
+  <worldbody>
+    <body name="base" pos="0.1 0 0.2">
+      <geom type="box" size="0.025 0.025 0.025" rgba="0.9 0.7 0.1 1"/>
+      <body name="shoulder" pos="0 0 0.05">
+        <joint name="shoulder_pan" type="hinge" axis="0 0 1"/>
+        <geom type="capsule" size="0.015 0.04" rgba="0.9 0.7 0.1 1"/>
+        <body name="upper_arm" pos="0 0 0.08">
+          <joint name="shoulder_lift" type="hinge" axis="0 1 0"/>
+          <geom type="capsule" size="0.012 0.05" rgba="0.9 0.7 0.1 1"/>
+          <body name="lower_arm" pos="0 0 0.1">
+            <joint name="elbow_flex" type="hinge" axis="0 1 0"/>
+            <geom type="capsule" size="0.012 0.05" rgba="0.9 0.7 0.1 1"/>
+            <body name="wrist" pos="0 0 0.1">
+              <joint name="wrist_flex" type="hinge" axis="0 1 0"/>
+              <geom type="capsule" size="0.01 0.03" rgba="0.9 0.7 0.1 1"/>
+              <body name="gripper" pos="0 0 0.06">
+                <joint name="wrist_roll" type="hinge" axis="0 0 1"/>
+                <geom type="box" size="0.018 0.025 0.012" rgba="0.9 0.7 0.1 1"/>
+                <site name="graspframe" pos="0 0 0.04" size="0.004"/>
+                <camera name="wrist_cam" pos="0 -0.04 0" euler="0.398 0 3.14159"/>
+                <body name="moving_jaw" pos="0 0 0.02">
+                  <joint name="gripper" type="hinge" axis="0 1 0"/>
+                  <geom type="box" size="0.004 0.02 0.004"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="desk" mocap="true">
+      <geom name="desk_top" type="box" size="0.35 0.45 0.03"/>
+    </body>
+    <body name="mobile_platform" mocap="true">
+      <geom name="platform_bottom" type="box" size="0.15 0.12 0.001"/>
+      <geom name="platform_middle" type="box" size="0.15 0.12 0.001"/>
+      <geom name="platform_top" type="box" size="0.15 0.12 0.001"/>
+      <geom name="platform_post_fl" type="cylinder" size="0.006 0.001" pos="0.13 0.10 0"/>
+      <geom name="platform_post_fr" type="cylinder" size="0.006 0.001" pos="0.13 -0.10 0"/>
+      <geom name="platform_post_rl" type="cylinder" size="0.006 0.001" pos="-0.13 0.10 0"/>
+      <geom name="platform_post_rr" type="cylinder" size="0.006 0.001" pos="-0.13 -0.10 0"/>
+    </body>
+    <body name="piece" mocap="true">
+      <geom name="piece_body" type="box" size="0.02 0.02 0.001"/>
+    </body>
+    <body name="piece_cyl" mocap="true">
+      <geom name="piece_cyl_body" type="cylinder" size="0.001 0.001"/>
+    </body>
+    <body name="dropbox" mocap="true">
+      <geom name="box_bottom" type="box" size="0.04 0.04 0.002"/>
+      <geom name="box_wall_y1" type="box" size="0.04 0.004 0.001"/>
+      <geom name="box_wall_y2" type="box" size="0.04 0.004 0.001"/>
+      <geom name="box_wall_x1" type="box" size="0.004 0.032 0.001"/>
+      <geom name="box_wall_x2" type="box" size="0.004 0.032 0.001"/>
+    </body>
+  </worldbody>
+</mujoco>
