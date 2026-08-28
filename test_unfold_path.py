@@ -149,6 +149,9 @@ def main():
     assert U.segment_speed('elbow_flex', U.NORMAL_SPEED_DPS) == U.NORMAL_SPEED_DPS
 
     import smooth_move as sm
+    # 이 테스트는 경로 계약만 본다. 사용자 HOME의 실팔 calibration 대신
+    # 명시 fixture를 써서 공개 CI에서도 같은 clamp 입력으로 검증한다.
+    sm._bounds = lambda: FIXTURE_BOUNDS
     old_state = sm._state
     sm._state = lambda timeout=3.0: {'pan_lock': -15.6}
     try:

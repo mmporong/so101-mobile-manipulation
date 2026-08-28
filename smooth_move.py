@@ -53,13 +53,24 @@ def _state(timeout=3.0):
     return json.loads(urllib.request.urlopen(f'{BASE}/state', timeout=timeout).read())
 
 
-_K = arm_lib.load_kinematics()
-_MP = arm_lib.load_mapping()
+_K = None
+_MP = None
+
+
+def _runtime_kinematics():
+    """FK를 실제로 쓰는 시점에만 외부 ROS 기하와 관절 매핑을 읽는다."""
+    global _K, _MP
+    if _K is None:
+        _K = arm_lib.load_kinematics()
+    if _MP is None:
+        _MP = arm_lib.load_mapping()
+    return _K, _MP
 
 
 def fk_z(pose_deg):
-    q = arm_lib.servo_to_rad({f'{j}.pos': pose_deg[j] for j in J5}, _MP)
-    return _K.fk_pos(q)[2] - arm_lib.PAN0[2]
+    kinematics, mapping = _runtime_kinematics()
+    q = arm_lib.servo_to_rad({f'{j}.pos': pose_deg[j] for j in J5}, mapping)
+    return kinematics.fk_pos(q)[2] - arm_lib.PAN0[2]
 
 
 def _bounds():

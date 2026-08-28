@@ -8,6 +8,9 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import smooth_move
 
+assert smooth_move._K is None and smooth_move._MP is None, \
+    'HTTP command client import가 외부 ROS 기하를 미리 읽음'
+
 
 class Response(io.BytesIO):
     def __enter__(self):
