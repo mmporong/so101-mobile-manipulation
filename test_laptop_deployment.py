@@ -6,6 +6,7 @@ import io
 import os
 import pathlib
 import subprocess
+import tempfile
 
 import numpy as np
 
@@ -118,11 +119,17 @@ def test_environment_contract():
     assert 'peer_request="${SO101_PI_PEER:-jdamr.local}"' in text
     assert 'getent ahostsv4 "$peer_request"' in text
     assert 'export ROS_STATIC_PEERS="$peer_ip"' in text
-    env = dict(os.environ, ROS_DOMAIN_ID='99', ROS_LOCALHOST_ONLY='1',
-               ROS_STATIC_PEERS='does-not-resolve.invalid',
-               SO101_PI_PEER='192.0.2.1')
-    output = subprocess.check_output(
-        ['bash', str(HERE / 'laptop_ros_env.sh')], env=env, text=True)
+    assert 'SO101_ROS_SETUP:-/opt/ros/jazzy/setup.bash' in text
+    with tempfile.TemporaryDirectory() as temp_home:
+        ros_setup = pathlib.Path(temp_home) / 'setup.bash'
+        ros_setup.write_text(':\n')
+        env = dict(os.environ, HOME=temp_home, ROS_DOMAIN_ID='99',
+                   ROS_LOCALHOST_ONLY='1',
+                   ROS_STATIC_PEERS='does-not-resolve.invalid',
+                   SO101_PI_PEER='192.0.2.1',
+                   SO101_ROS_SETUP=str(ros_setup))
+        output = subprocess.check_output(
+            ['bash', str(HERE / 'laptop_ros_env.sh')], env=env, text=True)
     assert 'ROS_DOMAIN_ID=12' in output
     assert 'ROS_LOCALHOST_ONLY=<미설정>' in output
     assert 'ROS_STATIC_PEERS=192.0.2.1' in output

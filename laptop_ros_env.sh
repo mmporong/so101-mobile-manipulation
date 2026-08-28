@@ -22,14 +22,15 @@ elif [[ -n "${SO101_PI_PEER:-}" ]]; then
   exit 2
 fi
 
-if [[ ! -f /opt/ros/jazzy/setup.bash ]]; then
-  echo "ROS2 Jazzy 환경을 찾지 못했습니다: /opt/ros/jazzy/setup.bash" >&2
+ros_setup="${SO101_ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
+if [[ ! -f "$ros_setup" ]]; then
+  echo "ROS2 Jazzy 환경을 찾지 못했습니다: $ros_setup" >&2
   exit 2
 fi
 
 # ROS setup 스크립트 일부는 정의되지 않은 변수를 읽는다.
 set +u
-source /opt/ros/jazzy/setup.bash
+source "$ros_setup"
 if [[ -f "$HOME/jdamr_cube_ws/install/setup.bash" ]]; then
   source "$HOME/jdamr_cube_ws/install/setup.bash"
 fi
