@@ -438,6 +438,63 @@ def test_stable_marker_metadata_mismatch_is_preserved_and_blocks_before_bus():
             assert target.read_bytes() == original
 
 
+def test_valid_v4_nonserial_marker_does_not_block_physical_serial_namespace():
+    resolver = lambda _port: {'ID_SERIAL': 'SO101_PHYSICAL_ARM'}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        fake_device = '/dev/fake-test-artifact'
+        fake_identity = stable_device_identity(fake_device)
+        fake_key = hashlib.sha256(fake_identity.encode()).hexdigest()[:20]
+        fake_marker = root / f'{fake_key}.json'
+        payload = {
+            'version': maintenance_tx.MARKER_VERSION,
+            'identity_kind': 'nonserial-path',
+            'device': fake_device,
+            'device_identity': fake_identity,
+            'device_key': fake_key,
+            'scope': 'test-only',
+            'expected': [],
+        }
+        fake_marker.write_text(json.dumps(payload))
+        original = fake_marker.read_bytes()
+
+        physical = marker_path(
+            '/dev/ttyACM0', tmp, identity_resolver=resolver)
+
+        physical_identity = 'udev:serial:SO101_PHYSICAL_ARM'
+        expected_key = hashlib.sha256(physical_identity.encode()).hexdigest()[:20]
+        assert physical == root / f'{expected_key}.json'
+        assert fake_marker.read_bytes() == original
+        assert not physical.exists()
+
+
+def test_malformed_v4_nonserial_marker_still_blocks_physical_serial():
+    resolver = lambda _port: {'ID_SERIAL': 'SO101_PHYSICAL_ARM'}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        claimed_identity = 'path:/dev/other-test-device'
+        marker_key = hashlib.sha256(claimed_identity.encode()).hexdigest()[:20]
+        marker = root / f'{marker_key}.json'
+        marker.write_text(json.dumps({
+            'version': maintenance_tx.MARKER_VERSION,
+            'identity_kind': 'nonserial-path',
+            'device': '/dev/fake-test-artifact',
+            'device_identity': claimed_identity,
+            'device_key': marker_key,
+            'scope': 'test-only',
+            'expected': [],
+        }))
+        original = marker.read_bytes()
+
+        try:
+            marker_path('/dev/ttyACM0', tmp, identity_resolver=resolver)
+        except RuntimeError as exc:
+            assert 'nonserial marker 검증 실패' in str(exc)
+        else:
+            raise AssertionError('손상된 nonserial marker가 물리 serial gate를 통과함')
+        assert marker.read_bytes() == original
+
+
 def test_v3_identity_prefix_is_not_physical_provenance():
     resolver = lambda _port: {'ID_SERIAL': 'SO101_CURRENT_PHYSICAL'}
     aliases = ('injected:EXPLICIT_ALIAS_A', 'udev:serial:EXPLICIT_ALIAS_A')

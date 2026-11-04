@@ -41,6 +41,17 @@ def main():
             json.dumps(accepted).encode())
         assert smooth_move._post('pose', joints={}) == accepted
 
+        # accepted 응답 뒤 /command terminal을 확인해야 실제 적용 완료다.
+        replies = iter((
+            {'id': 'cmd-1', 'op': 'pose', 'status': 'executing'},
+            {'id': 'cmd-1', 'op': 'pose', 'status': 'completed',
+             'applied_action': {'wrist_flex': 4.0}},
+        ))
+        smooth_move.urllib.request.urlopen = lambda *_a, **_k: Response(
+            json.dumps(next(replies)).encode())
+        terminal = smooth_move._wait_terminal(accepted, timeout=1.0)
+        assert terminal['status'] == 'completed'
+
         original_post, original_state = smooth_move._post, smooth_move._state
         profile = {'teleop': False}
         poses = []

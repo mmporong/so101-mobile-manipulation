@@ -1,5 +1,5 @@
 #!/bin/bash
-# 수집 배치 1회: 예열 → 세우기 → N사이클 → 준비 자세 대기(토크 유지).
+# 수집 배치: 예열 → 세우기 → N사이클 → 휴지 자세 복귀(토크 OFF).
 set -o pipefail
 # ★ 단일 실행 잠금 (2026-08-26 사고) — 과거 파킹 종료 토크 OFF 경로와 다음
 # 배치가 겹쳐 팔이 주저앉았다. 현재 종료 정책이 달라도 중복 제어는 계속 막는다.
@@ -10,6 +10,37 @@ fi
 N=${1:-5}
 PY=$HOME/miniforge3/envs/lerobot/bin/python
 API=http://127.0.0.1:8765
+
+finish_to_rest() {
+    local original_rc=$1
+    trap - EXIT INT TERM
+    curl -s -m 60 -X POST "$API/cmd" -H 'Content-Type: application/json' \
+        -d '{"op":"rec_cancel"}' >/dev/null 2>&1 || true
+    echo "── 3/4 휴지 자세 복귀 · 토크 OFF"
+    local rest_rc=0
+    timeout 440 "$PY" "$HOME/so101-mobile-manipulation/rest_recovery.py" \
+        || rest_rc=$?
+    if [ "$rest_rc" -ne 0 ]; then
+        echo "⛔ 휴지 자세 복귀를 검증하지 못했습니다 — 대시보드에서 현재 상태를 확인하세요"
+    fi
+
+    local img="$HOME/so101_datasets/so101_car/images"
+    if [ -d "$img" ]; then
+        local sz
+        sz=$(du -sh "$img" 2>/dev/null | cut -f1)
+        rm -rf "$img" 2>/dev/null && echo "── 임시 프레임 정리: $sz"
+    fi
+    df -h /home | tail -1 | awk '{print "── 디스크 여유 "$4" ("$5" 사용)"}'
+    echo "── 4/4 배치 종료"
+    if [ "$original_rc" -ne 0 ]; then
+        exit "$original_rc"
+    fi
+    exit "$rest_rc"
+}
+
+trap 'finish_to_rest $?' EXIT
+trap 'finish_to_rest 130' INT
+trap 'finish_to_rest 143' TERM
 
 post_required() {
     local label=$1 payload=$2
@@ -80,19 +111,7 @@ for i in $(seq 1 12); do          # 개방 완료 대기 — 도중에 park 가 
     sleep 1
 done
 echo "── 2/4 수집 ${N}사이클"
-HF_HUB_OFFLINE=1 $PY $HOME/so101-mobile-manipulation/collect_cycles.py "$N" 2>&1 | tee $HOME/so101_datasets/collect_full.log | grep -E '━━|✔|✗|성공|실패|중단|지터|Error|Traceback'
-# ★ 실패해도 휴지로 접지 않는다 (2026-08-27 사용자 지시): 매번 접었다 펴면
-# 시간이 갈리고 문제 재현도 느려진다. 준비(ㄷ자) 자세에서 토크 유지로 대기한다.
-echo "── 3/4 준비 자세 대기 (휴지 파킹 안 함)"
-curl -s -m 20 -X POST $API/cmd -H 'Content-Type: application/json' -d '{"op":"torque","on":true}' >/dev/null
-sleep 1
-timeout 240 $PY "$HOME/so101-mobile-manipulation/unfold_safe.py" 2>&1 | tail -1
-# ★ 임시 프레임 정리 (2026-08-26) — 실패한 에피소드의 PNG 가 지워지지 않고
-# 쌓여 8.8G 를 먹었다. 영상 인코딩이 끝나면 images/ 는 항상 버려도 되는 캐시다.
-IMG="$HOME/so101_datasets/so101_car/images"
-if [ -d "$IMG" ]; then
-    SZ=$(du -sh "$IMG" 2>/dev/null | cut -f1)
-    rm -rf "$IMG" 2>/dev/null && echo "── 임시 프레임 정리: $SZ"
-fi
-df -h /home | tail -1 | awk '{print "── 디스크 여유 "$4" ("$5" 사용)"}'
-echo "── 4/4 배치 종료"
+HF_HUB_OFFLINE=1 $PY "$HOME/so101-mobile-manipulation/collect_cycles.py" "$N" \
+    2>&1 | tee "$HOME/so101_datasets/collect_full.log" \
+    | grep -E '━━|✔|✗|성공|실패|중단|지터|Error|Traceback'
+exit ${PIPESTATUS[0]}

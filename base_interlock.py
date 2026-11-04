@@ -31,6 +31,7 @@ class BaseInterlock:
     def __init__(self, *, linear_max_mps, angular_max_rps, stationary_hold_s,
                  odom_freshness_s, cmd_vel_freshness_s, graph_freshness_s,
                  lease_s, cmd_vel_owner, driver_subscriber,
+                 cmd_vel_input_owner=None,
                  clock=time.monotonic):
         self.linear_max_mps = float(linear_max_mps)
         self.angular_max_rps = float(angular_max_rps)
@@ -40,12 +41,17 @@ class BaseInterlock:
         self.graph_freshness_s = float(graph_freshness_s)
         self.lease_s = float(lease_s)
         self.cmd_vel_owner = str(cmd_vel_owner).lstrip('/')
+        self.cmd_vel_input_owner = (
+            None if cmd_vel_input_owner is None
+            else str(cmd_vel_input_owner).lstrip('/'))
         self.driver_subscriber = str(driver_subscriber).lstrip('/')
         self.clock = clock
         self.lock = threading.Lock()
         self._odom_at = self._cmd_vel_at = self._graph_at = None
         self._odom = self._cmd_vel = None
         self._publishers = self._subscribers = []
+        self._input_publishers = []
+        self._input_ready = True
         self._stationary_since = None
         self._expires_at = 0.0
         self._reason = '베이스 증거 없음'
@@ -61,9 +67,29 @@ class BaseInterlock:
                 and velocity[0] <= self.linear_max_mps
                 and velocity[1] <= self.angular_max_rps)
 
+    def _input_mode(self):
+        if self.cmd_vel_input_owner is None:
+            return 'legacy'
+        if not self._input_publishers:
+            return 'no_input_owner'
+        if self._input_publishers == [(self.cmd_vel_input_owner, '/')]:
+            return 'mission_input'
+        return 'invalid_input_owner'
+
+    def _input_problem(self):
+        if self.cmd_vel_input_owner is None:
+            return None
+        allowed = [(self.cmd_vel_input_owner, '/')]
+        if self._input_publishers not in ([], allowed):
+            return f'/cmd_vel_smoothed 입력 소유권 불일치: {self._input_publishers}'
+        if self._input_publishers == allowed and not self._input_ready:
+            return '/cmd_vel_smoothed 입력 명령 증거 대기'
+        return None
+
     def observe(self, *, odom_linear_mps, odom_angular_rps,
                 cmd_vel_linear_mps, cmd_vel_angular_rps,
                 cmd_vel_publishers, cmd_vel_subscribers,
+                cmd_vel_input_publishers=None, cmd_vel_input_ready=True,
                 odom_observed_at=None, cmd_vel_observed_at=None,
                 graph_observed_at=None, observed_at=None):
         """read-only ROS monitor가 수집한 odom·cmd_vel·graph 증거를 반영한다.
@@ -85,6 +111,7 @@ class BaseInterlock:
             ('odom linear', 'odom angular', 'cmd_vel linear', 'cmd_vel angular')))
         publishers = _identities(cmd_vel_publishers)
         subscribers = _identities(cmd_vel_subscribers)
+        input_publishers = _identities(cmd_vel_input_publishers)
         with self.lock:
             gaps = (
                 None if self._odom_at is None else odom_at - self._odom_at,
@@ -93,6 +120,8 @@ class BaseInterlock:
             self._odom_at, self._cmd_vel_at, self._graph_at = odom_at, cmd_at, graph_at
             self._odom, self._cmd_vel = values[:2], values[2:]
             self._publishers, self._subscribers = publishers, subscribers
+            self._input_publishers = input_publishers
+            self._input_ready = cmd_vel_input_ready is True
             if not self._stopped(self._odom):
                 self._revoke(
                     f'odom 이동 중: linear={values[0]:.3f}, angular={values[1]:.3f}',
@@ -114,6 +143,10 @@ class BaseInterlock:
                 self._revoke(f'/cmd_vel 최종 소유권 불일치: {publishers}',
                              reset_hold=True)
                 return self._snapshot_locked(now)
+            input_problem = self._input_problem()
+            if input_problem:
+                self._revoke(input_problem, reset_hold=True)
+                return self._snapshot_locked(now)
             if (self.driver_subscriber, '/') not in subscribers:
                 self._revoke(f'베이스 driver 구독자 없음: {(self.driver_subscriber, "/")}',
                              reset_hold=True)
@@ -123,7 +156,7 @@ class BaseInterlock:
                 self._revoke(f'정지 유지 대기: {held:.2f}/{self.stationary_hold_s:.2f}s')
                 return self._snapshot_locked(now)
             self._expires_at = now + self.lease_s
-            self._reason = 'odom·cmd_vel 정지 capability 유효'
+            self._reason = 'odom·주행 명령 정지 capability 유효'
             return self._snapshot_locked(now)
 
     def _snapshot_locked(self, now):
@@ -142,6 +175,8 @@ class BaseInterlock:
                 self._revoke('/cmd_vel 이동 명령', reset_hold=True)
             elif self._publishers != [(self.cmd_vel_owner, '/')]:
                 self._revoke('/cmd_vel 최종 소유권 불일치', reset_hold=True)
+            elif self._input_problem():
+                self._revoke(self._input_problem(), reset_hold=True)
             elif (self.driver_subscriber, '/') not in self._subscribers:
                 self._revoke('베이스 driver 구독자 없음', reset_hold=True)
             elif self._expires_at > 0.0 and now >= self._expires_at:
@@ -151,7 +186,8 @@ class BaseInterlock:
         return {'active': active, 'reason': self._reason,
                 'expires_at': self._expires_at, 'stationary_for_s': held,
                 'odom_at': self._odom_at, 'cmd_vel_at': self._cmd_vel_at,
-                'graph_at': self._graph_at}
+                'graph_at': self._graph_at,
+                'cmd_vel_input_mode': self._input_mode()}
 
     def snapshot(self):
         with self.lock:

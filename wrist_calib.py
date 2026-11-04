@@ -21,6 +21,7 @@
 """
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -29,10 +30,11 @@ import urllib.request
 import cv2
 import numpy as np
 
-BASE = 'http://127.0.0.1:8765'
+BASE = os.environ.get('SO101_PANEL_API', 'http://127.0.0.1:8765').rstrip('/')
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import arm_lib                                     # noqa: E402
+import box_vision                                  # noqa: E402
 
 GAIN_FILE = HERE / 'servo_gain.json'
 # 후보 임계 — 넓은 쪽부터 좁혀 간다. 사람 살색이 섞이지 않는 선이 상한이다.
@@ -55,14 +57,14 @@ def get(path):
     return json.loads(urllib.request.urlopen(f'{BASE}{path}', timeout=15).read())
 
 
-def frame():
+def frame(*, with_meta=False):
     """원자 endpoint에서 freshness가 검증된 손목캠 한 프레임."""
     global _last_frame_sequence
     from wrist_yolo import read_atomic_frame
     image, meta = read_atomic_frame(
         BASE, timeout=8, previous=_last_frame_sequence)
     _last_frame_sequence = meta['sequence']
-    return image
+    return (image, dict(meta)) if with_meta else image
 
 
 def _mask(img, ranges):
@@ -71,6 +73,150 @@ def _mask(img, ranges):
     for lo, hi in ranges:
         m |= cv2.inRange(hsv, np.array(lo), np.array(hi))
     return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+
+# 빨간색이라는 이유만으로 큐브라고 부르지 않는다. 갈색 골판지의 어두운 면이
+# 기존 HSV 범위 끝(H=13~14)에 걸린 실제 오검출이 있었으므로, 큐브 양성 판정은
+# 색상과 함께 정사각형 면의 충실도·볼록도·운영 가능한 화면 크기를 모두 요구한다.
+CUBE_MAX_HUE_DISTANCE = 12.0
+CUBE_MIN_SATURATION = 100.0
+CUBE_MIN_VALUE = 45.0
+CUBE_MIN_RECT_FILL = 0.60
+CUBE_MIN_SOLIDITY = 0.75
+CUBE_MAX_ELONGATION = 1.75
+CUBE_MIN_AREA_RATIO = 0.0010
+CUBE_MAX_AREA_RATIO = 0.70
+
+
+def order_detected_quad(points):
+    """공용 contour quad 정렬 계약을 유지하는 하위호환 진입점."""
+    return box_vision.order_detected_quad(points)
+
+
+def _cube_component_evidence(img, hsv, labels, stats, centers, index):
+    area = int(stats[index, cv2.CC_STAT_AREA])
+    component = (labels == index).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    contour_area = float(cv2.contourArea(contour))
+    hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+    (_, _), (rect_w, rect_h), angle = cv2.minAreaRect(contour)
+    if rect_w < 1.0 or rect_h < 1.0:
+        return None
+    if rect_w < rect_h:
+        angle += 90.0
+    elongation = float(max(rect_w, rect_h) / min(rect_w, rect_h))
+    rect_fill = float(np.clip(area / max(rect_w * rect_h, 1.0), 0.0, 1.0))
+    solidity = float(np.clip(contour_area / max(hull_area, 1.0), 0.0, 1.0))
+    image_area = float(img.shape[0] * img.shape[1])
+    area_ratio = float(area / max(image_area, 1.0))
+    pixels = hsv[component > 0]
+    median_h, median_s, median_v = (
+        float(value) for value in np.median(pixels, axis=0))
+    hue_distance = float(min(median_h, 180.0 - median_h))
+    x, y, width, height = (
+        int(stats[index, cv2.CC_STAT_LEFT]),
+        int(stats[index, cv2.CC_STAT_TOP]),
+        int(stats[index, cv2.CC_STAT_WIDTH]),
+        int(stats[index, cv2.CC_STAT_HEIGHT]),
+    )
+    perimeter = float(cv2.arcLength(contour, True))
+    approximated = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+    raw_corners = None
+    ordered_corners = None
+    if len(approximated) == 4 and cv2.isContourConvex(approximated):
+        raw_corners = approximated.reshape(4, 2).astype(float)
+        try:
+            ordered_corners = order_detected_quad(raw_corners)
+        except ValueError:
+            ordered_corners = None
+    edge_margin = 2.0
+    fully_visible = bool(
+        x > edge_margin and y > edge_margin
+        and x + width < img.shape[1] - edge_margin
+        and y + height < img.shape[0] - edge_margin)
+    checks = {
+        'red_hue': hue_distance <= CUBE_MAX_HUE_DISTANCE,
+        'saturation': median_s >= CUBE_MIN_SATURATION,
+        'value': median_v >= CUBE_MIN_VALUE,
+        'rect_fill': rect_fill >= CUBE_MIN_RECT_FILL,
+        'solidity': solidity >= CUBE_MIN_SOLIDITY,
+        'elongation': elongation <= CUBE_MAX_ELONGATION,
+        'scale': CUBE_MIN_AREA_RATIO <= area_ratio <= CUBE_MAX_AREA_RATIO,
+    }
+    rejected = [name for name, passed in checks.items() if not passed]
+    identity_confirmed = bool(not rejected and fully_visible)
+    quality = ('METRIC_CONFIRMED'
+               if identity_confirmed and ordered_corners is not None
+               else 'FULL_TRACK' if identity_confirmed else 'PARTIAL_TRACK')
+    evidence = {
+        'target_profile': 'red_cube_v1',
+        'identity_confirmed': identity_confirmed,
+        'quality': quality,
+        'fully_visible': fully_visible,
+        'corner_source': ('detected_vertices'
+                          if ordered_corners is not None else None),
+        'raw_corners_px': (None if raw_corners is None
+                           else raw_corners.tolist()),
+        'ordered_corners_px': (None if ordered_corners is None
+                               else ordered_corners.tolist()),
+        'rejected_checks': rejected,
+        'area_px2': float(area),
+        'area_ratio': area_ratio,
+        'center_px': [float(centers[index][0]), float(centers[index][1])],
+        'axis_deg': float(angle) % 90.0,
+        'elongation': elongation,
+        'rect_fill': rect_fill,
+        'solidity': solidity,
+        'median_hsv': [median_h, median_s, median_v],
+        'hue_distance': hue_distance,
+        'bbox': [x, y, width, height],
+        'frame_size': [int(img.shape[1]), int(img.shape[0])],
+    }
+    # 여러 적색 성분 중 실제 큐브를 고르기 위한 양성 점수다. 면적은 박스가 더
+    # 클 수 있으므로 순위의 마지막 항목으로만 쓴다.
+    evidence['identity_score'] = float(
+        0.30 * min(rect_fill / CUBE_MIN_RECT_FILL, 1.0)
+        + 0.30 * min(solidity / CUBE_MIN_SOLIDITY, 1.0)
+        + 0.15 * min(CUBE_MAX_ELONGATION / max(elongation, 1.0), 1.0)
+        + 0.15 * min(median_s / CUBE_MIN_SATURATION, 1.0)
+        + 0.10 * min(CUBE_MAX_HUE_DISTANCE / max(hue_distance, 1.0), 1.0))
+    return evidence
+
+
+def detect_cube_candidates(img, ranges, min_area=150):
+    """프레임의 모든 적색 연결 성분을 큐브 근거로 평가한다."""
+    mask = _mask(img, ranges)
+    n, labels, stats, centers = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        return []
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    candidates = []
+    for index in range(1, n):
+        if int(stats[index, cv2.CC_STAT_AREA]) < int(min_area):
+            continue
+        evidence = _cube_component_evidence(
+            img, hsv, labels, stats, centers, index)
+        if evidence is not None:
+            candidates.append(evidence)
+    return sorted(candidates, key=lambda item: (
+        bool(item['identity_confirmed']), float(item['identity_score']),
+        float(item['area_px2'])), reverse=True)
+
+
+def detect_cube_evidence(img, ranges, min_area=150):
+    """최선의 큐브 후보를 반환한다.
+
+    가장 큰 적색 영역이 아니라 양성 형상 조건을 통과한 후보를 먼저 고른다.
+    따라서 갈색 반납함의 붉은 면이 더 커도 화면 아래의 실제 큐브를 놓치지 않는다.
+    적색 후보는 있지만 모두 실패하면 가장 큐브에 가까운 후보를
+    ``identity_confirmed=False``로 반환해 호출자가 모호한 장면으로 닫게 한다.
+    """
+    candidates = detect_cube_candidates(img, ranges, min_area=min_area)
+    return candidates[0] if candidates else None
 
 
 def detect(img, ranges, min_area=150):
@@ -112,10 +258,11 @@ def detect_axis(img, ranges, min_area=150):
             float(max(w, h) / min(w, h)))
 
 
-def tcp_now():
+def tcp_now(api=None):
     K = arm_lib.load_kinematics()
     MP = arm_lib.load_mapping()
-    pos = get('/state')['pos']
+    pos = (get('/state') if api is None
+           else arm_lib.worker_state(str(api), timeout=3.0))['pos']
     q = arm_lib.servo_to_rad({f'{j}.pos': pos[j] for j in arm_lib.JOINTS}, MP)
     p = K.fk_pos(q)
     return [p[i] - arm_lib.PAN0[i] for i in range(3)]

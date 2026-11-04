@@ -23,6 +23,7 @@ CLI 세 단계(lerobot-calibrate → jog_test → ik_verify)를 버튼으로 옮
 """
 import json
 import math
+import os
 import pathlib
 import queue
 import threading
@@ -66,10 +67,12 @@ def _load_car_limits():
                     'shoulder_lift_velocity_max',
                     'acceleration', 'arm_torque_limit', 'pose_max_step_deg',
                     'state_max_age_s', 'base_interlock_required',
+                    'camera_axes_enabled',
                     'base_linear_max_mps', 'base_angular_max_rps',
                     'base_stationary_hold_s', 'base_odom_freshness_s',
                     'base_cmd_vel_freshness_s', 'base_graph_freshness_s',
                     'base_capability_lease_s', 'base_cmd_vel_owner',
+                    'base_cmd_vel_input_owner',
                     'base_driver_subscriber')
         if any(k not in data for k in required):
             raise ValueError('필수 키 누락')
@@ -78,12 +81,9 @@ def _load_car_limits():
         return None
 
 # ── 안전 임계 (2026-08-19 발연 사고 후 도입) ──────────────────────────────────
-# STS3215 의 기본 과온 한계는 70°C 다. 그보다 낮은 곳에서 스스로 멈춰야 보호가 된다.
-TEMP_WARN, TEMP_STOP = 55, 62      # °C
-TEMP_SEC = 8.0                     # 온도 판독 최소 간격 [s] — 틱 기반(유휴 간극
-                                   # 25회)은 명령이 몰리면 주기가 한없이 늘어졌다
-                                   # (15차 리뷰 M4). 이동 중(_interp 블로킹)엔 원래
-                                   # 안 읽힌다 — 그 구간은 전류·스톨 감시가 담당.
+GUARD_TELEMETRY_SEC = 8.0          # 유휴 전류·전압 판독 최소 간격 [s]
+GUARD_READ_ATTEMPTS = 3            # 단일 패킷 누락과 실제 버스 단절을 구분한다
+GUARD_READ_RETRY_SEC = 0.015       # 3회 실패까지 최대 30ms만 지연 후 fail-closed
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 STALL_LAG_DEG = 15.0               # 움직이고는 있어도 보간 목표에서 이만큼 뒤처지면 끊는다
@@ -93,8 +93,11 @@ LIMIT_MARGIN_DEG = 2.0             # 캘리브 범위 끝에서 이만큼은 남
 TORQUE_ON_TOL_DEG = 3.0            # 토크 켜기 전 검사의 **바깥** 허용 — raw 카운트로 환산해 쓴다
 STOP_TEST_MAX_S = 3.0              # stop_test 대기 상한 — 워커가 오래 자면 감시가 전부 멎는다
 
-# 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
-# 위치 기반 감지도 0.5초를 기다려야 한다.
+# 전류는 가장 빠른 스톨 신호다. 위치 기반 감지는 0.5초를 기다려야 한다.
+# Present_Temperature 소프트웨어 판독은 2026-08-28 폐지했다. 실물은 차가운데도
+# ID 6 응답 누락·68°C 래치 오독이 동작 중 정지 latch를 반복해서 만들었다.
+# 서보 EEPROM의 자체 과온 보호는 유지하며, 소프트웨어는 전류·스톨·위치·전압과
+# 통신 상태만 감시한다.
 #
 # STS3215 데이터시트 실사양 — 단위는 6.5mA/LSB.
 #   7.4V 19kg (리더): 무부하 150mA · 정격 650mA · 스톨 2.5A
@@ -162,8 +165,10 @@ class Worker(threading.Thread):
         self.lock = threading.Lock()
         self._command_changed = threading.Condition(self.lock)
         profile = _load_car_limits()
+        surface_runtime = arm_lib.surface_runtime_context()
         self.state = {'connected': False, 'calibrated': False, 'torque': False,
                       'recording': False, 'pos': {}, 'range': {}, 'log': [],
+                      'temp': {}, 'temperature_monitoring': False,
                       'speed_pct': 50, 'cam': None, 'teleop': False,
                       'pan_lock': None,
                       'pan_tol': (float(profile['pan_lock_tol_deg'])
@@ -174,7 +179,21 @@ class Worker(threading.Thread):
                       'last_command': None, 'base_interlock_active': False,
                       'base_interlock_reason': '베이스 증거 없음',
                       'base_interlock_expires_at': 0.0,
-                      'stop_latched': False, 'actuation_epoch': 0}
+                      'stop_latched': False, 'actuation_epoch': 0,
+                      'stop_source': None, 'stop_reason': None,
+                      'connection_generation': 0,
+                      'min_clearance_mm': None,
+                      'clearance_obstacle_kind': None,
+                      'clearance_envelope_kind': None,
+                      'clearance_sample_index': None,
+                      'clearance_provenance': None,
+                      'minimum_swept_clearance_m': None,
+                      'clearance_type': None,
+                      'clearance_source': None}
+        self.state.update(surface_runtime)
+        self._active_collision_authority = None
+        self._pending_place_transaction = None
+        self._place_transactions = {}
         self.state['maintenance_dirty'] = False
         self.bus = None
         self.profile = profile
@@ -194,6 +213,7 @@ class Worker(threading.Thread):
                 graph_freshness_s=profile['base_graph_freshness_s'],
                 lease_s=profile['base_capability_lease_s'],
                 cmd_vel_owner=profile['base_cmd_vel_owner'],
+                cmd_vel_input_owner=profile['base_cmd_vel_input_owner'],
                 driver_subscriber=profile['base_driver_subscriber'])
             self._base_interlock_provider = self.base_interlock.snapshot
         else:
@@ -271,6 +291,8 @@ class Worker(threading.Thread):
     def update_base_evidence(self, *, odom_linear_mps, odom_angular_rps,
                              cmd_vel_linear_mps, cmd_vel_angular_rps,
                              cmd_vel_publishers, cmd_vel_subscribers,
+                             cmd_vel_input_publishers=None,
+                             cmd_vel_input_ready=True,
                              odom_observed_at=None, cmd_vel_observed_at=None,
                              graph_observed_at=None, observed_at=None):
         """로컬 ROS monitor 전용 입력. browser command op로 노출하지 않는다."""
@@ -283,6 +305,8 @@ class Worker(threading.Thread):
             cmd_vel_angular_rps=cmd_vel_angular_rps,
             cmd_vel_publishers=cmd_vel_publishers,
             cmd_vel_subscribers=cmd_vel_subscribers,
+            cmd_vel_input_publishers=cmd_vel_input_publishers,
+            cmd_vel_input_ready=cmd_vel_input_ready,
             odom_observed_at=odom_observed_at,
             cmd_vel_observed_at=cmd_vel_observed_at,
             graph_observed_at=graph_observed_at, observed_at=observed_at)
@@ -292,9 +316,14 @@ class Worker(threading.Thread):
     def snapshot(self):
         self._base_status()
         with self.lock:
-            return dict(self.state, pos=dict(self.state['pos']),
-                        range={k: tuple(v) for k, v in self.state['range'].items()},
-                        log=list(self.state['log']))
+            surface = dict(self.state['surface_profile'])
+            surface['uncertainty'] = dict(surface.get('uncertainty') or {})
+            return dict(
+                self.state, pos=dict(self.state['pos']),
+                range={k: tuple(v) for k, v in self.state['range'].items()},
+                log=list(self.state['log']), surface_profile=surface,
+                metric_calibration=dict(self.state['metric_calibration']),
+                target_policies=dict(self.state['target_policies']))
 
     def estimate_motion_duration(self, target):
         """현재 검증 상태에서 관절 목표까지의 최소 안전 이동시간을 계산한다.
@@ -350,6 +379,7 @@ class Worker(threading.Thread):
         op = str(op)
         if op == 'stop':
             raise ValueError('STOP은 stop_and_cancel(reason)으로만 요청해야 합니다')
+        trace_metadata = self._command_trace_metadata(op, args)
         with self.lock:
             if command_id is None:
                 self._command_seq += 1
@@ -357,17 +387,44 @@ class Worker(threading.Thread):
             command_id = str(command_id)
             if command_id in self._commands:
                 raise ValueError(f'중복 command_id: {command_id}')
+            accepted_at = time.monotonic()
             item = {'id': command_id, 'op': op, 'status': 'accepted',
                     'epoch': self._actuation_epoch,
-                    'accepted_at': time.monotonic(), 'applied_action': None,
-                    'reason': None}
+                    'accepted_at': accepted_at,
+                    'accepted_wall_time': time.time(),
+                    'executing_at': None, 'executing_wall_time': None,
+                    'terminal_at': None, 'terminal_wall_time': None,
+                    'actual_duration_s': None,
+                    'applied_action': None, 'reason': None}
+            item.update({
+                'surface_profile': dict(self.state['surface_profile']),
+                'metric_calibration': dict(self.state['metric_calibration']),
+                'target_policies': dict(self.state['target_policies']),
+                'min_clearance_mm': None,
+                'clearance_obstacle_kind': None,
+                'clearance_envelope_kind': None,
+                'clearance_sample_index': None,
+                'clearance_provenance': None,
+                'minimum_swept_clearance_m': None,
+                'clearance_type': None,
+                'clearance_source': None,
+            })
+            item.update(trace_metadata)
             self._commands[command_id] = item
             self._prune_commands_locked()
             self.state['last_command'] = dict(item)
             torque_off = op == 'torque' and len(args) == 1 and args[0] is False
             rearm = op == 'rearm' and not args
+            # 첫 연결이 실패하면 Worker는 fail-closed로 STOP latch를 건다. 이때
+            # 연결도 일반 동작과 함께 거부하면, 전원·배선을 복구해도 패널을 통째로
+            # 재시작하기 전에는 다시 붙을 방법이 없다. 미연결 상태의 connect는
+            # 서보를 움직이는 명령이 아니라 버스·EEPROM·토크 상태를 다시 증명하는
+            # 복구 명령이므로 latch 아래에서도 허용한다. 이미 연결된 상태에서는
+            # reconnect가 될 수 있어 기존 거부 규칙을 유지한다.
+            connect_recovery = op == 'connect' and not self.state.get('connected')
             if self._shutdown_started or (self._stop_latched.is_set()
-                                          and not (torque_off or rearm)):
+                                          and not (torque_off or rearm
+                                                   or connect_recovery)):
                 reason = ('worker 종료가 시작되었습니다' if self._shutdown_started
                           else '정지 latch 활성 — 새 명령 거부')
                 emit = self._terminalize_locked(command_id, 'rejected', reason=reason)
@@ -377,6 +434,50 @@ class Worker(threading.Thread):
             self.cmd.put({'id': command_id, 'op': op, 'args': tuple(args),
                           'epoch': item['epoch']})
         return command_id
+
+    def _command_trace_metadata(self, op, args):
+        """명령 상태 API에 남길 이동 목표·시간 계약을 부작용 없이 계산한다."""
+        if op != 'move_q' or len(args) not in (2, 3):
+            return {}
+        try:
+            q_rad = [float(value) for value in args[0]]
+            seconds = float(args[1])
+            if len(q_rad) != len(ARM) or not math.isfinite(seconds) or seconds <= 0:
+                return {}
+            mapping = arm_lib.load_mapping()
+            target = {
+                joint: mapping['signs'][joint] * math.degrees(q_rad[index])
+                       + mapping['offsets'][joint]
+                for index, joint in enumerate(ARM)
+            }
+            current = self.snapshot().get('pos') or {}
+            delta = target['wrist_roll'] - float(current['wrist_roll'])
+            if delta > 180 and -180 <= target['wrist_roll'] - 360 <= 180:
+                target['wrist_roll'] -= 360
+            elif delta < -180 and -180 <= target['wrist_roll'] + 360 <= 180:
+                target['wrist_roll'] += 360
+            roll_gap = abs((target['wrist_roll']
+                            - float(current['wrist_roll']) + 180) % 360 - 180)
+            roll_seconds = 0.0
+            if roll_gap > ROLL_FIRST_DEG:
+                velocity = self._joint_velocity(
+                    'wrist_roll', self._profile_vel()) * 0.087
+                roll_seconds = max(1.5, roll_gap / max(velocity, 0.5))
+            # move_q는 큰 roll을 먼저 끝낸 뒤 본 보간을 실행한다. 각 _interp의
+            # 도달 확인 여유까지 포함해야 caller가 정상 실행을 먼저 끊지 않는다.
+            phases = 2 if roll_seconds else 1
+            expected = seconds + roll_seconds + 4.0 * phases
+            recommended = max(30.0, expected * 1.5 + 5.0)
+            return {
+                'target_joints_deg': {joint: round(value, 4)
+                                      for joint, value in target.items()},
+                'expected_duration_s': round(expected, 3),
+                'recommended_wait_timeout_s': round(recommended, 3),
+                'joint_tracking_error_deg': None,
+                'peak_joint_tracking_error_deg': {},
+            }
+        except (KeyError, TypeError, ValueError, RuntimeError, SystemExit):
+            return {}
 
     def _prune_commands_locked(self):
         """최근 256개 상태만 보존하되 accepted/executing 명령은 버리지 않는다."""
@@ -427,8 +528,15 @@ class Worker(threading.Thread):
             return None
         if status not in ('completed', 'rejected'):
             raise ValueError(f'terminal status 아님: {status}')
+        terminal_at = time.monotonic()
         item['status'] = status
-        item['updated_at'] = time.monotonic()
+        item['updated_at'] = terminal_at
+        item['terminal_at'] = terminal_at
+        item['terminal_wall_time'] = time.time()
+        started_at = item.get('executing_at') or item.get('accepted_at')
+        if isinstance(started_at, (int, float)):
+            item['actual_duration_s'] = round(
+                max(0.0, terminal_at - float(started_at)), 6)
         if applied is not None:
             item['applied_action'] = {k: float(v) for k, v in applied.items()}
         if reason is not None:
@@ -454,7 +562,19 @@ class Worker(threading.Thread):
             self._emit_terminal(*emit)
         return self.command_status(command_id)
 
-    def _request_stop(self, reason):
+    def _record_stop_cause(self, source, reason, *, replace=True):
+        source, reason = str(source).strip(), str(reason).strip()
+        if source not in ('base_interlock', 'operator', 'transport', 'guard',
+                          'shutdown'):
+            raise ValueError(f'알 수 없는 정지 원인: {source}')
+        if not reason:
+            raise ValueError('정지 사유가 필요합니다')
+        with self.lock:
+            if replace or not self.state.get('stop_source'):
+                self.state['stop_source'] = source
+                self.state['stop_reason'] = reason
+
+    def _request_stop(self, reason, source='operator'):
         """actuation gate와 command lock 아래에서 stop을 원자적으로 생성한다."""
         reason = str(reason).strip()
         if not reason:
@@ -468,6 +588,8 @@ class Worker(threading.Thread):
             self.abort.set()
             with self.lock:
                 self.state['stop_latched'] = True
+                self.state['stop_source'] = str(source)
+                self.state['stop_reason'] = reason
                 self.state['actuation_epoch'] = self._actuation_epoch
                 for cid, command in list(self._commands.items()):
                     if command['status'] == 'accepted':
@@ -484,8 +606,12 @@ class Worker(threading.Thread):
                 stop_id = f'cmd-{self._command_seq:08d}'
                 item = {'id': stop_id, 'op': 'stop', 'status': 'accepted',
                         'epoch': self._actuation_epoch,
-                        'accepted_at': time.monotonic(), 'applied_action': None,
-                        'reason': None}
+                        'accepted_at': time.monotonic(),
+                        'accepted_wall_time': time.time(),
+                        'executing_at': None, 'executing_wall_time': None,
+                        'terminal_at': None, 'terminal_wall_time': None,
+                        'actual_duration_s': None,
+                        'applied_action': None, 'reason': None}
                 self._commands[stop_id] = item
                 self.state['last_command'] = dict(item)
                 self.cmd.put({'id': stop_id, 'op': 'stop', 'args': (),
@@ -494,9 +620,9 @@ class Worker(threading.Thread):
             self._emit_terminal(*emit)
         return stop_id, cancelled
 
-    def stop_and_cancel(self, reason):
+    def stop_and_cancel(self, reason, source='operator'):
         """정지 latch·pending 취소·tracked stop 생성을 하나의 경계에서 수행한다."""
-        stop_id, _cancelled = self._request_stop(reason)
+        stop_id, _cancelled = self._request_stop(reason, source=source)
         return stop_id
 
     def cancel_pending(self, reason):
@@ -518,6 +644,29 @@ class Worker(threading.Thread):
                 item['reason'] = str(reason)
             self.state['last_command'] = dict(item)
             self._command_changed.notify_all()
+
+    def _record_joint_tracking(self, observed, target):
+        """활성 이동의 최신/최대 관절 추종 오차를 command status에 누적한다."""
+        cid = self._active_command_id
+        if not cid or not isinstance(observed, dict) or not isinstance(target, dict):
+            return
+        errors = {
+            joint: round(abs((float(observed[joint]) - float(target[joint])
+                              + 180) % 360 - 180), 4)
+            for joint in ARM if joint in observed and joint in target
+        }
+        if not errors:
+            return
+        with self.lock:
+            item = self._commands.get(cid)
+            if not item:
+                return
+            peak = dict(item.get('peak_joint_tracking_error_deg') or {})
+            for joint, error in errors.items():
+                peak[joint] = max(float(peak.get(joint, 0.0)), error)
+            item['joint_tracking_error_deg'] = errors
+            item['peak_joint_tracking_error_deg'] = peak
+            self.state['last_command'] = dict(item)
 
     def _reject_motion(self, reason):
         self._command_update('rejected', reason=reason)
@@ -722,7 +871,10 @@ class Worker(threading.Thread):
                             self._active_command_op = op
                             self._active_command_epoch = cmd.get('epoch')
                             tracked['status'] = 'executing'
-                            tracked['updated_at'] = time.monotonic()
+                            executing_at = time.monotonic()
+                            tracked['updated_at'] = executing_at
+                            tracked['executing_at'] = executing_at
+                            tracked['executing_wall_time'] = time.time()
                             self.state['last_command'] = dict(tracked)
                             self._command_changed.notify_all()
                     else:
@@ -732,7 +884,10 @@ class Worker(threading.Thread):
                     if self._active_command_id:
                         current = self.command_status(self._active_command_id)
                         if current['status'] == 'executing':
-                            stale = (op not in ('stop', 'rearm') and
+                            torque_off = (op == 'torque' and len(args) == 1
+                                          and args[0] is False)
+                            stale = (op not in ('stop', 'rearm')
+                                     and not torque_off and
                                      (self._stop_latched.is_set() or
                                       self._active_command_epoch !=
                                       self._actuation_epoch))
@@ -746,6 +901,8 @@ class Worker(threading.Thread):
                                     self._command_update(
                                         'rejected', reason='mechanical STOP 미증명')
                             elif isinstance(result, dict):
+                                self._validate_terminal_collision_evidence()
+                                self._commit_place_transaction()
                                 self._command_update('completed', applied=result)
                             elif result is not False:
                                 self._command_update('completed')
@@ -759,6 +916,8 @@ class Worker(threading.Thread):
                     self._command_update('rejected', reason=f'{type(e).__name__}: {e}')
                     self.say(f'⚠ {op}: {type(e).__name__}: {e}')
                 finally:
+                    self._active_collision_authority = None
+                    self._pending_place_transaction = None
                     self._active_command_id = None
                     self._active_command_op = None
                     self._active_command_epoch = None
@@ -793,6 +952,41 @@ class Worker(threading.Thread):
             lambda: self._write_eeprom_safety(calib),
             lambda _result: self._verify_eeprom_safety(calib),
             complete=lambda _result: self._apply_motion_profile())
+
+    def _verify_energized_safety_readonly(self, calib, torque_state):
+        """토크 ON 재연결을 쓰기 없이 다시 자격화한다.
+
+        서버 재시작만으로 정상 파지 중인 팔의 토크를 껐다 켜는 대신, 먼저
+        STOP hold가 입증된 상태에서 기존 캘리브·EEPROM 보호값·런타임 상한을
+        전부 read-back한다. 값 하나라도 더 크거나 0(무제한)이면 계속 잠근다.
+        """
+        if torque_state != 'on':
+            raise PermissionError(
+                f'통전 재검증은 6축 exact ON에서만 가능: {torque_state}')
+        if not self.profile:
+            raise RuntimeError('차량 안전 프로필 없음')
+        if not isinstance(calib, dict) or set(ALL) - set(calib):
+            raise RuntimeError('완전한 캘리브 파일 없음')
+        base = self._base_status()
+        if self.profile.get('base_interlock_required') and not base['active']:
+            raise RuntimeError(f'베이스 인터록: {base["reason"]}')
+
+        self._verify_eeprom_safety(calib)
+        hard_velocity = int(self.profile['goal_velocity_max'])
+        acceleration = int(self.profile['acceleration'])
+        torque_limit = int(self.profile['arm_torque_limit'])
+        for motor in ALL:
+            limits = {
+                'Goal_Velocity': self._joint_velocity(motor, hard_velocity),
+                'Acceleration': acceleration,
+            }
+            if motor in ARM:
+                limits['Torque_Limit'] = torque_limit
+            for register, upper in limits.items():
+                actual = int(self.bus.read(register, motor, normalize=False))
+                if actual <= 0 or actual > upper:
+                    raise RuntimeError(
+                        f'{motor}.{register} read-back {actual}, 허용 1~{upper}')
 
     def _stale_maintenance(self):
         return read_dirty_marker(
@@ -924,6 +1118,8 @@ class Worker(threading.Thread):
             self.abort.set()
             with self.lock:
                 self.state['stop_latched'] = True
+                self.state['stop_source'] = 'transport'
+                self.state['stop_reason'] = str(reason)
                 self.state['actuation_epoch'] = self._actuation_epoch
                 self.state['safety_ready'] = False
                 self.state['safety_reason'] = str(reason)
@@ -954,7 +1150,8 @@ class Worker(threading.Thread):
         # stop 적용 증거를 재사용하지 않는다. 새 epoch를 먼저 열고 다시 입증한다.
         self._stop_applied_epoch = None
         self._request_stop(
-            f'연결 시 통전 상태 {torque_state} — 정지 증명 후 rearm 필요')
+            f'연결 시 통전 상태 {torque_state} — 정지 증명 후 rearm 필요',
+            source='transport')
         if self._do_stop():
             return True
         with self.lock:
@@ -1054,11 +1251,18 @@ class Worker(threading.Thread):
                      and not energized_connect)
         safety_reason = ('보호 레지스터 검증 전' if torque_state == 'off' else
                          f'maintenance 필요 — 연결 시 토크 상태 {torque_state}; EEPROM 미접근')
-        if energized_connect:
-            safety_reason = (
-                f'연결 시 통전 상태 {torque_state} 정지 완료 — '
-                'STOP latch 유지, exact OFF 재연결·전체 재검증 필요')
-        else:
+        if energized_connect and not stale_maintenance:
+            try:
+                self._verify_energized_safety_readonly(calib, torque_state)
+                safety_ok = True
+                safety_reason = (
+                    '통전 재연결 STOP·캘리브·보호값·런타임 상한 read-back 완료')
+                self.say('통전 재연결 read-only 검증 PASS — STOP latch만 유지')
+            except Exception as e:
+                safety_ok = False
+                safety_reason = f'통전 재연결 read-only 검증 실패: {e}'
+                self.say(f'⛔ 통전 재연결 검증 실패: {type(e).__name__}: {e}')
+        elif not energized_connect:
             try:
                 self._sync_eeprom_safety(calib, torque_state)
                 safety_reason = 'EEPROM 보호·차량 동작 프로필 read-back 완료'
@@ -1086,6 +1290,8 @@ class Worker(threading.Thread):
             self.say(f'⛔ 연결 상태 자세 확인 실패: {type(e).__name__}')
         with self.lock:
             self.state['connected'] = True
+            self.state['connection_generation'] = int(
+                self.state.get('connection_generation') or 0) + 1
             self.state['calibrated'] = calibrated
             self.state['safety_ready'] = safety_ok
             self.state['safety_reason'] = safety_reason
@@ -1099,8 +1305,13 @@ class Worker(threading.Thread):
         # 성공한 어댑터의 신원을 학습해 둔다 — 다음부터 자동 선택이 확정적이 된다
         try:
             arm_lib.remember_arm_port(self.port)
-        except Exception:
-            pass
+            with self.lock:
+                self.state['port_persistence_error'] = None
+        except Exception as exc:
+            message = f'팔 포트 기억 실패: {type(exc).__name__}: {exc}'
+            with self.lock:
+                self.state['port_persistence_error'] = message
+            self.say(f'⚠ {message}')
         self.say(f'연결됨 · 캘리브 {"로드됨" if calibrated else "불완전/없음 — ② 진행 필요"} · '
                  f'안전검증 {"PASS" if safety_ok else "FAIL — 이동 잠금"}')
 
@@ -1312,12 +1523,28 @@ class Worker(threading.Thread):
         pct = max(5, min(100, int(pct * 0.75)))
         with self.lock:
             self.state['speed_pct'] = pct
+        if self._stop_latched.is_set():
+            self.say(f'속도 {pct}% 저장 — STOP latch 해제 후 이동 직전 적용')
+            return True
         if self.snapshot().get('teleop'):
             self.say(f'속도 {pct}% 저장 — 텔레옵 중이라 해제 후에 적용')
             return True
         if self.snapshot()['connected']:
             try:
-                self._apply_motion_profile()
+                # 물체를 문 gripper는 접촉 때문에 Overload 상태가 정상적으로
+                # 유지될 수 있다. 팔 속도를 바꾸면서 gripper 레지스터까지 다시
+                # 쓰면 그 정상 접촉 응답을 통신 장애로 오인해 상승을 막는다.
+                velocity = min(self._profile_vel(),
+                               int(self.profile['goal_velocity_max']))
+                for m in ARM:
+                    joint_velocity = self._joint_velocity(m, velocity)
+                    self._bus_write('Goal_Velocity', m, joint_velocity,
+                                    normalize=False)
+                    got = int(self.bus.read(
+                        'Goal_Velocity', m, normalize=False))
+                    if got != joint_velocity:
+                        raise RuntimeError(
+                            f'{m}.Goal_Velocity: {got} != {joint_velocity}')
             except Exception as e:
                 with self.lock:
                     self.state['safety_ready'] = False
@@ -1349,6 +1576,42 @@ class Worker(threading.Thread):
             self.state['torque'] = (True if torque_state == 'on'
                                     else False if torque_state == 'off' else None)
 
+    def _base_idle_hold_can_be_skipped(self):
+        """베이스 이동 전 기존 목표 유지로 충분한지 fresh evidence로 판정한다."""
+        torque_state = self._read_torque_state()
+        self._set_torque_state(torque_state)
+        if torque_state != 'on':
+            return False
+        with self.lock:
+            pending = any(command['status'] in ('accepted', 'executing')
+                          for command in self._commands.values())
+            last = dict(self.state.get('last_command') or {})
+            active = self._active_command_id is not None
+        if active or pending or last.get('status') != 'completed':
+            return False
+        applied = last.get('applied_action')
+        if last.get('op') not in ('jog', 'goto', 'pose', 'move_q') \
+                or not isinstance(applied, dict):
+            return False
+        try:
+            target = {motor: float(applied[motor])
+                      for motor in ARM if motor in applied}
+            if not target:
+                return False
+            present = self.bus.sync_read('Present_Position', tuple(target))
+            goal = self.bus.sync_read('Goal_Position', tuple(target))
+            if set(target) - set(present) or set(target) - set(goal):
+                return False
+            for motor, expected in target.items():
+                goal_gap = abs((float(goal[motor]) - expected + 180) % 360 - 180)
+                settled_gap = abs((float(present[motor]) - float(goal[motor]) + 180)
+                                  % 360 - 180)
+                if goal_gap > 0.5 or settled_gap > STALL_GAP_DEG:
+                    return False
+        except Exception:
+            return False
+        return True
+
     def _tcp_z(self, servo):
         mapping = arm_lib.load_mapping()
         q = arm_lib.servo_to_rad({f'{j}.pos': servo[j] for j in ARM}, mapping)
@@ -1378,7 +1641,7 @@ class Worker(threading.Thread):
             pos = {j: self._number(pos[j], f'{j} 현재 위치') for j in ALL}
             center = self._number(self.profile['pan_lock_center_deg'], '팬 중심')
             tol = self._number(self.profile['pan_lock_tol_deg'], '팬 허용폭')
-            floor_z = self._number(arm_lib.load_gain('floor_z_m')['floor_z_m'], 'floor_z')
+            floor_z = self._number(arm_lib.surface_floor_z(), 'floor_z')
             tcp_z = self._tcp_z(pos)
         except Exception as e:
             return False, f'현재 자세 안전 검증 실패: {type(e).__name__}: {e}'
@@ -1680,7 +1943,7 @@ class Worker(threading.Thread):
             full = {j: out.get(j, current[j]) for j in ARM}
             try:
                 tcp_z_pan = self._tcp_z(full)
-                floor_z = float(arm_lib.load_gain('floor_z_m')['floor_z_m'])
+                floor_z = float(arm_lib.surface_floor_z())
             except Exception as e:
                 return self._reject_motion(f'이동 거부 — TCP floor 검증 실패: {type(e).__name__}')
             if tcp_z_pan < floor_z + 0.005:
@@ -1688,11 +1951,14 @@ class Worker(threading.Thread):
                     f'이동 거부 — TCP z={tcp_z_pan:.3f}m가 floor 안전여유 아래')
         return out
 
-    def _write_motion(self, goals, *, limit_step=False, check_floor=True):
+    def _write_motion(self, goals, *, limit_step=False, check_floor=True,
+                      pre_write=None):
         applied = self._prepare_motion(goals, limit_step=limit_step,
                                        check_floor=check_floor)
         if applied is None:
             return None
+        if pre_write is not None:
+            pre_write(applied)
         try:
             self._goal_write(applied)
         except Exception as e:
@@ -1775,8 +2041,9 @@ class Worker(threading.Thread):
                 return
             try:
                 c = abs(self.bus.read('Present_Current', joint, normalize=False))
-            except Exception:
-                c = 0
+            except Exception as exc:
+                self._safety_fault('stop_test 전류 읽기 실패', exc)
+                return self._reject_motion('stop_test 전류 읽기 실패')
             hi = hi + 1 if c >= CURRENT_STOP else 0
             if hi >= CURRENT_HOLD:
                 self._kill_torque(f'과전류 {joint}={c} (stop_test 중, 임계 {CURRENT_STOP})')
@@ -1843,12 +2110,13 @@ class Worker(threading.Thread):
         self.say(f'{joint} → {float(value):.0f}')
         return applied
 
-    def _do_pose(self, joints):
+    def _do_pose(self, joints, collision_authority=None):
         """여러 관절을 한 번에 절대 목표로 — 정책(ACT) 실행 루프용 (2026-08-24).
 
         goto 를 관절마다 따로 보내면 10Hz 정책 주기를 못 맞춘다. 검증은
         goto 와 동일(캘리브 범위 클램프·그리퍼 0~100), 쓰기는 sync_write 한 번.
         """
+        self._activate_collision_authority(collision_authority)
         if not isinstance(joints, dict):
             return self._reject_motion('pose 목표는 dict여야 합니다')
         unknown = set(joints) - set(ALL)
@@ -1874,7 +2142,16 @@ class Worker(threading.Thread):
                 return self._reject_motion(f'pose 거부 — gripper {gv:.1f}가 0~100 밖')
             goals['gripper'] = gv
         if goals:
-            applied = self._write_motion(goals, limit_step=True, check_floor=True)
+            # terminal servo write 직전에 static/live/run/camera/transaction을
+            # 다시 검증한다. 큐 대기 시간은 이 gate를 통과하지 못한다.
+            self._activate_collision_authority(collision_authority)
+            stationary_release = (
+                set(goals) == {'gripper'}
+                and self._pending_place_transaction is not None)
+            applied = self._write_motion(
+                goals, limit_step=True, check_floor=True,
+                pre_write=(self._validate_stationary_release_clearance
+                           if stationary_release else None))
             if applied is None:
                 return None
             # ★ 기록 신선도 (2026-08-24): 텔레옵 스트림은 큐를 계속 채워 _poll 이
@@ -1945,7 +2222,7 @@ class Worker(threading.Thread):
             self.state['safety_ready'] = False
             self.state['safety_reason'] = reason
         stopped = self._latch_and_apply_stop(
-            reason, synchronous_terminal=True)
+            reason, source='guard', synchronous_terminal=True)
         if not stopped:
             return 'unknown'
         outcome = ('torque_off' if self.snapshot().get('torque_state') == 'off'
@@ -2054,14 +2331,15 @@ class Worker(threading.Thread):
         self.say('⏹ 정지 latch 유지 — 현재 자세 유지, rearm 필요')
         return stopped
 
-    def _latch_and_apply_stop(self, reason, *, hot_gripper=False,
+    def _latch_and_apply_stop(self, reason, *, source='guard', hot_gripper=False,
                               synchronous_terminal=False):
         """안전 사건을 epoch에 먼저 기록한 뒤 같은 호출에서 정지를 입증한다."""
         stop_id = None
         if not self._stop_latched.is_set():
-            stop_id, _cancelled = self._request_stop(reason)
+            stop_id, _cancelled = self._request_stop(reason, source=source)
         else:
             self.abort.set()
+            self._record_stop_cause(source, reason)
         stopped = self._do_stop()
         evidence = getattr(self, '_last_stop_evidence', {})
         # 카메라 정지가 실패해도 과열 그리퍼 완화를 건너뛰지 않는다.
@@ -2088,6 +2366,8 @@ class Worker(threading.Thread):
 
     def _stop_camera_axes(self):
         """STOP 경계에서 카메라 축도 hold, 실패 시 exact OFF를 확인한다."""
+        if not self._camera_axes_enabled():
+            return True
         if not self.bus or not hasattr(self.bus, 'packet_handler'):
             return True
         ok = True
@@ -2127,6 +2407,8 @@ class Worker(threading.Thread):
             self._stop_latched.clear()
             with self.lock:
                 self.state['stop_latched'] = False
+                self.state['stop_source'] = None
+                self.state['stop_reason'] = None
                 self.state['actuation_epoch'] = self._actuation_epoch
         self.say('▶ STOP latch 해제 — 다음 명령부터 새 안전 검사를 수행합니다')
         return True
@@ -2140,7 +2422,7 @@ class Worker(threading.Thread):
         if not self.profile:
             raise RuntimeError('차량 안전 프로필 없음')
         vel = min(self._profile_vel(), int(self.profile['goal_velocity_max']))
-        for m in ALL:
+        for m in ARM:
             joint_velocity = self._joint_velocity(m, vel)
             self._bus_write('Goal_Velocity', m, joint_velocity, normalize=False)
             if int(self.bus.read('Goal_Velocity', m, normalize=False)) != joint_velocity:
@@ -2206,15 +2488,149 @@ class Worker(threading.Thread):
                              for j in ARM})
                 for i in range(steps + 1)]
 
+    def _record_clearance(self, report):
+        clearance = float(report['min_clearance_m'])
+        if not math.isfinite(clearance):
+            raise RuntimeError('궤적 최소 clearance가 유한하지 않습니다')
+        clearance_type = report.get('clearance_type', 'separation')
+        if clearance_type not in arm_lib.COLLISION_CLEARANCE_TYPES:
+            raise RuntimeError('궤적 clearance type이 잘못됐습니다')
+        fields = {
+            'min_clearance_mm': round(clearance * 1000, 3),
+            'minimum_swept_clearance_m': clearance,
+            'clearance_type': clearance_type,
+            'clearance_source': report.get(
+                'clearance_source', arm_lib.COLLISION_CLEARANCE_SOURCE),
+            'clearance_obstacle_kind': report['obstacle_kind'],
+            'clearance_envelope_kind': report['envelope_kind'],
+            'clearance_sample_index': int(report['sample_index']),
+            'clearance_provenance': report['provenance'],
+        }
+        with self.lock:
+            self.state.update(fields)
+            item = self._commands.get(self._active_command_id)
+            if item is not None:
+                item.update(fields)
+                self.state['last_command'] = dict(item)
+
+    def _trajectory_envelope_report(self, cur, target, steps=100):
+        """전체 보간에서 링크·말단·부속 envelope의 작업면 여유 최솟값."""
+        if set(cur) < set(ARM) or set(target) < set(ARM):
+            raise ValueError('궤적 envelope 검증에는 ARM 전체 자세가 필요합니다')
+        cur = {joint: self._number(cur[joint], f'{joint} 시작') for joint in ARM}
+        target = {joint: self._number(target[joint], f'{joint} 목표') for joint in ARM}
+        steps = max(2, int(steps))
+        floor_z = float(arm_lib.surface_floor_z())
+        gripper = (self.snapshot().get('pos') or {}).get('gripper')
+        held_object = isinstance(gripper, (int, float)) and float(gripper) < 25.0
+        attachment = arm_lib.load_attachment_authority(required=held_object)
+        authority = self._active_collision_authority
+        obstacles = arm_lib.collision_obstacles(
+            required=(held_object or authority is not None
+                      or bool(os.environ.get('SO101_MISSION_RUN_ID'))),
+            collision_authority=(None if authority is None else authority['canonical_json']),
+            collision_authority_hash=(None if authority is None else authority['hash']))
+        minimum = None
+        blocking = None
+        planned = None
+        authority_payload = (None if authority is None else json.loads(
+            authority['canonical_json']))
+        for sample_index in range(steps + 1):
+            alpha = sample_index / steps
+            servo = {
+                joint: cur[joint] + (target[joint] - cur[joint]) * alpha
+                for joint in ARM
+            }
+            for envelope in arm_lib.motion_envelopes(
+                    servo, held_object=held_object, attachment=attachment):
+                clearance = (float(envelope['point_pan_m'][2]) - floor_z
+                             - float(envelope['radius_m']))
+                candidate = {
+                    'min_clearance_m': clearance,
+                    'required_clearance_m': float(
+                        envelope['required_clearance_m']),
+                    'obstacle_kind': envelope['obstacle_kind'],
+                    'envelope_kind': envelope['envelope_kind'],
+                    'sample_index': sample_index,
+                    'sample_count': steps + 1,
+                    'provenance': envelope['provenance'],
+                }
+                if minimum is None or clearance < minimum['min_clearance_m']:
+                    minimum = candidate
+                if (clearance < candidate['required_clearance_m']
+                        and (blocking is None
+                             or clearance < blocking['min_clearance_m'])):
+                    blocking = candidate
+                for obstacle in obstacles:
+                    contact = arm_lib.planned_support_contact(
+                        envelope, obstacle, authority_payload)
+                    if contact is not None:
+                        contact.update(sample_index=sample_index,
+                                       sample_count=steps + 1)
+                        if (planned is None or contact['min_clearance_m']
+                                < planned['min_clearance_m']):
+                            planned = contact
+                        continue
+                    obstacle_clearance = arm_lib.obstacle_clearance(
+                        envelope['point_pan_m'], envelope['radius_m'], obstacle)
+                    candidate = {
+                        'min_clearance_m': obstacle_clearance,
+                        'required_clearance_m': float(
+                            envelope['required_clearance_m']),
+                        'obstacle_kind': obstacle['obstacle_kind'],
+                        'envelope_kind': envelope['envelope_kind'],
+                        'sample_index': sample_index,
+                        'sample_count': steps + 1,
+                        'provenance': arm_lib.COLLISION_CLEARANCE_PROVENANCE,
+                    }
+                    if minimum is None or obstacle_clearance < minimum['min_clearance_m']:
+                        minimum = candidate
+                    if (obstacle_clearance < candidate['required_clearance_m']
+                            and (blocking is None or obstacle_clearance
+                                 < blocking['min_clearance_m'])):
+                        blocking = candidate
+        if minimum is None:
+            raise RuntimeError('궤적 envelope 표본이 비었습니다')
+        if blocking is not None:
+            return blocking
+        return planned if planned is not None else minimum
+
+    def _validate_stationary_release_clearance(self, _applied):
+        """gripper release servo write 직전 실제 정지 자세의 collision 증거."""
+        pending = self._pending_place_transaction
+        if not isinstance(pending, dict) or pending.get('stage_index') != 1:
+            raise RuntimeError('collision-bound gripper release stage가 아닙니다')
+        current = self.bus.sync_read('Present_Position', ARM)
+        report = self._trajectory_envelope_report(current, current, steps=2)
+        self._record_clearance(report)
+        if report['min_clearance_m'] < report['required_clearance_m']:
+            raise RuntimeError(
+                f'release 정지 자세 {report["envelope_kind"]} 여유 '
+                f'{report["min_clearance_m"] * 1000:.1f}mm가 요구 '
+                f'{report["required_clearance_m"] * 1000:.1f}mm 아래 '
+                f'(obstacle={report["obstacle_kind"]})')
+
     def _swept_floor_reason(self, cur, target, steps=100):
         try:
-            floor_z = float(arm_lib.load_gain('floor_z_m')['floor_z_m'])
+            floor_z = float(arm_lib.surface_floor_z())
             samples = self._trajectory_floor_samples(cur, target, steps)
         except Exception as e:
             return f'궤적 TCP floor 검증 실패: {type(e).__name__}: {e}'
         low = min(samples)
         if low < floor_z + 0.005:
             return f'궤적 TCP 최저 z={low:.3f}m가 floor 안전여유 아래'
+        try:
+            report = self._trajectory_envelope_report(cur, target, steps)
+            self._record_clearance(report)
+        except Exception as e:
+            return f'궤적 envelope floor 검증 실패: {type(e).__name__}: {e}'
+        if report['min_clearance_m'] < report['required_clearance_m']:
+            return (
+                f'궤적 {report["envelope_kind"]} 최저 여유 '
+                f'{report["min_clearance_m"] * 1000:.1f}mm가 요구 '
+                f'{report["required_clearance_m"] * 1000:.1f}mm 아래 '
+                f'(obstacle={report["obstacle_kind"]}, '
+                f'sample={report["sample_index"]})')
         return None
 
     def _motion_tick_ready(self, goal):
@@ -2300,13 +2716,12 @@ class Worker(threading.Thread):
                                           f'{CURRENT_STOP*6.5/1000:.1f}A)')
                         return False
 
-            if i % 25 == 0:
+            if i % 10 == 0:
                 try:
                     now = self.bus.sync_read('Present_Position', ARM)
                     # 이동 중에도 기록이 실상태를 보게 — _poll 은 이 명령이 끝날
                     # 때까지 굶는다 (스크립트 수집 데이터 88% 동결의 진범).
-                    with self.lock:
-                        self.state['pos'].update(now)
+                    observed_at = time.monotonic()
                 except Exception:
                     # 읽기가 안 되면 통신이 흔들리는 것이다 — 그동안에도 서보는
                     # 마지막 목표를 향해 계속 민다. _do_stop 은 위치를 다시 써서
@@ -2319,6 +2734,8 @@ class Worker(threading.Thread):
                 # wait_reached 가 진행 중인 이동을 타임아웃 오판한다(감사 M4).
                 with self.lock:
                     self.state['pos'] = dict(self.state['pos'], **now)
+                    self.state['pos_at'] = observed_at
+                self._record_joint_tracking(now, goal_tick)
                 if watch is not None:
                     # ★ 관절별로 본다. 전체 max 로 묶으면(종전 방식) 한 관절이
                     # 막혀도 다른 관절이 움직이는 동안은 "moved 가 크다"로 읽혀
@@ -2343,7 +2760,7 @@ class Worker(threading.Thread):
                     #   상한이 허용하는 이동량의 절반 이상을 소화하고 있으면
                     #   막힌 게 아니라 최고 속도로 가는 중이다. (진짜 부분 스톨은
                     #   전류 감시(0.2초)가 더 먼저 잡는 것이 보통이다.)
-                    win_cap = self._profile_vel() * 0.087 * 0.5   # 0.5초 창 최대 이동 [°]
+                    win_cap = self._profile_vel() * 0.087 * 0.2   # 0.2초 창 최대 이동 [°]
                     stuck = [j for j in ARM
                              if (abs(now[j] - watch[j]) < STALL_MOVE_DEG
                                  and lag[j] > STALL_GAP_DEG)
@@ -2391,18 +2808,21 @@ class Worker(threading.Thread):
         deadline = None                       # 첫 관측의 잔여 거리로 동적으로 잡는다
         watch = None
         while True:
-            time.sleep(0.5)
+            time.sleep(0.2)
             if self.abort.is_set():
                 self._do_stop()
                 return False
             try:
                 fin = self.bus.sync_read('Present_Position', ARM)
+                observed_at = time.monotonic()
                 cur_a = self.bus.sync_read('Present_Current', ARM, normalize=False)
             except Exception:
                 self._hold_or_kill('도달 확인 읽기 실패 — 통신 이상')
                 return False
             with self.lock:
                 self.state['pos'] = dict(self.state['pos'], **fin)
+                self.state['pos_at'] = observed_at
+            self._record_joint_tracking(fin, target)
             for j, v in cur_a.items():
                 if abs(v) > self._peak.get(j, 0):
                     self._peak[j] = abs(v)
@@ -2436,8 +2856,110 @@ class Worker(threading.Thread):
                 return False
             watch = fin
 
-    def _do_move_q(self, q_rad, seconds):
+    def _activate_collision_authority(self, authority):
+        """terminal motion 직전에 command payload와 현재 static binding을 재검증한다."""
+        self._active_collision_authority = None
+        self._pending_place_transaction = None
+        if authority is None:
+            arm_lib.collision_obstacles(required=False)
+            return
+        if not isinstance(authority, dict) or set(authority) != {
+                'canonical_json', 'hash'}:
+            raise RuntimeError('command collision authority envelope가 잘못됐습니다')
+        encoded = authority['canonical_json']
+        digest = authority['hash']
+        env = os.environ
+        generation = env.get('SO101_WRIST_CAMERA_GENERATION')
+        sequence = env.get('SO101_CAMERA_SEQUENCE')
+        validated = arm_lib.validate_collision_authority(
+            encoded, digest,
+            static_payload=env.get(arm_lib.COLLISION_STATIC_ENV),
+            static_hash=env.get(arm_lib.COLLISION_STATIC_HASH_ENV),
+            profile=arm_lib.selected_surface_profile(),
+            expected_run_id=env.get('SO101_MISSION_RUN_ID'),
+            expected_camera_generation=(None if generation is None else int(generation)),
+            expected_sequence=(None if sequence is None else int(sequence)))
+        if encoded != arm_lib.canonical_json(validated):
+            raise RuntimeError('command collision authority가 canonical JSON이 아닙니다')
+        transaction = validated.get('transaction')
+        if transaction is not None:
+            transaction_id = transaction['transaction_id']
+            stage = transaction['stage']
+            binding_hash = arm_lib.place_transaction_binding_hash(validated)
+            committed = self._place_transactions.get(transaction_id)
+            if committed is None:
+                if stage['index'] != 0:
+                    raise RuntimeError('place transaction은 descent stage로 시작해야 합니다')
+            else:
+                if committed['binding_hash'] != binding_hash:
+                    raise RuntimeError('place transaction immutable binding이 변조됐습니다')
+                expected_index = committed['stage_index'] + 1
+                if stage['index'] != expected_index:
+                    raise RuntimeError('place transaction stage 순서/중복이 잘못됐습니다')
+                if stage['index'] > 0 and transaction['stage_nonces'][
+                        stage['index'] - 1] != committed['stage_nonce']:
+                    raise RuntimeError('place transaction 직전 stage nonce가 불일치합니다')
+            self._pending_place_transaction = {
+                'transaction_id': transaction_id,
+                'binding_hash': binding_hash,
+                'stage_index': stage['index'],
+                'stage_nonce': stage['nonce'],
+                'expires_at': float(transaction['expires_at']),
+            }
+            with self.lock:
+                item = self._commands.get(self._active_command_id)
+                if item is not None:
+                    item.update({
+                        'collision_authority_hash': digest,
+                        'collision_static_hash': validated['static_hash'],
+                        'target_status_digest': validated['evidence']['status_digest'],
+                        'transaction_id': transaction_id,
+                        'transaction_stage': stage['name'],
+                        'transaction_stage_index': stage['index'],
+                        'transaction_nonce': stage['nonce'],
+                    })
+                    self.state['last_command'] = dict(item)
+        self._active_collision_authority = {
+            'canonical_json': encoded, 'hash': digest}
+
+    def _validate_terminal_collision_evidence(self):
+        """place stage를 완료 처리하기 직전에 clearance/binding을 증명한다."""
+        if self._pending_place_transaction is None:
+            return
+        with self.lock:
+            item = dict(self._commands.get(self._active_command_id) or {})
+        clearance = item.get('minimum_swept_clearance_m')
+        if (type(clearance) not in (int, float)
+                or not math.isfinite(float(clearance))):
+            raise RuntimeError('place terminal에 유한한 swept clearance가 없습니다')
+        required = (
+            'collision_authority_hash', 'collision_static_hash',
+            'target_status_digest', 'transaction_id', 'transaction_stage',
+            'transaction_stage_index', 'transaction_nonce',
+            'clearance_source', 'clearance_provenance')
+        missing = [name for name in required
+                   if item.get(name) is None or item.get(name) == '']
+        if missing:
+            raise RuntimeError('place terminal collision 증거 누락: ' + ', '.join(missing))
+
+    def _commit_place_transaction(self):
+        """terminal move 완료 후에만 다음 stage를 연다."""
+        pending = self._pending_place_transaction
+        if pending is None:
+            return
+        transaction_id = pending['transaction_id']
+        committed = self._place_transactions.get(transaction_id)
+        expected_index = 0 if committed is None else committed['stage_index'] + 1
+        if (pending['stage_index'] != expected_index
+                or (committed is not None
+                    and committed['binding_hash'] != pending['binding_hash'])):
+            raise RuntimeError('place transaction terminal commit 순서가 불일치합니다')
+        self._place_transactions[transaction_id] = dict(pending)
+        self._pending_place_transaction = None
+
+    def _do_move_q(self, q_rad, seconds, collision_authority=None):
         """URDF 관절각[rad] 5개로 보간 이동."""
+        self._activate_collision_authority(collision_authority)
         if not isinstance(q_rad, (list, tuple)) or len(q_rad) != len(ARM):
             return self._reject_motion('move_q는 5개 관절 배열이 필요합니다')
         try:
@@ -2507,6 +3029,10 @@ class Worker(threading.Thread):
             return self._reject_motion(
                 f'move_q 속도 복원 실패 — {cause} — {safety}')
 
+        # IK·궤적·속도 준비가 끝난 후, 실제 terminal move 직전
+        # raw freshness(최초 descent)나 transaction stage 만료를 재검증한다.
+        self._activate_collision_authority(collision_authority)
+
         # ★ 회전을 먼저, 이동을 나중에.
         #
         # 2026-08-19 사고의 순서 문제다. wrist_roll 이 98°(누운 자세)라 죠가 좌우로
@@ -2559,12 +3085,24 @@ class Worker(threading.Thread):
         base = {'active': bool(initial.get('base_interlock_active')),
                 'reason': initial.get('base_interlock_reason') or '베이스 증거 없음',
                 'expires_at': float(initial.get('base_interlock_expires_at') or 0.0)}
-        if (self._torque_may_be_on(initial)
-                and (self.profile or {}).get('base_interlock_required')
+        if ((self.profile or {}).get('base_interlock_required')
                 and not base['active'] and not self._base_stop_latched):
             self._base_stop_latched = True
-            self._do_stop()
-            self.say(f'⛔ 베이스 인터록 상실 — {base["reason"]}')
+            self._record_stop_cause(
+                'base_interlock', base['reason'], replace=False)
+            # 캐시된 UI 토크나 단순 queue-empty만으로 hold를 생략하지 않는다.
+            # fresh 6축 exact ON, pending 명령 없음, 직전 팔 이동 terminal 완료,
+            # Goal_Position과 Present_Position 정착이 모두 재확인된 경우만 기존
+            # 목표 유지로 충분하다. 하나라도 불명확하면 기존 hold/OFF 경계로 간다.
+            idle_goal_hold = self._base_idle_hold_can_be_skipped()
+            if idle_goal_hold:
+                self.say(f'⏸ 베이스 이동 — 팔 완료 자세 유지·새 팔 명령 잠금: '
+                         f'{base["reason"]}')
+            elif self.snapshot().get('torque_state') == 'off':
+                self.say(f'⏸ 베이스 이동 — 팔 토크 OFF 확인: {base["reason"]}')
+            else:
+                self._do_stop()
+                self.say(f'⛔ 베이스 인터록 상실 — {base["reason"]}')
         # 카메라 각도는 자주 안 바뀌므로 2초에 한 번만 — 팔 폴링(0.25s)에
         # 얹으면 버스 부하가 늘고, 이 버스는 급사 이력이 있다.
         now = time.monotonic()
@@ -2574,8 +3112,12 @@ class Worker(threading.Thread):
                 cam = self.cam_snapshot()
                 with self.lock:
                     self.state['cam'] = cam
-            except Exception:
-                pass
+                    self.state['camera_error'] = None
+            except Exception as exc:
+                message = f'카메라 상태 갱신 실패: {type(exc).__name__}: {exc}'
+                with self.lock:
+                    self.state['camera_error'] = message
+                self.say(f'⚠ {message}')
         try:
             st = initial
             if st['calibrated'] and not st['recording']:
@@ -2625,67 +3167,50 @@ class Worker(threading.Thread):
                 if outcome == 'held':
                     self.say('⚠ 통신 불안정 — 목표를 현재 자세로 재기록(토크 유지)')
                 self._reconnect()
-            return                    # 읽기가 실패한 회차엔 온도 감시를 건너뛴다
+            return                    # 읽기가 실패한 회차엔 유휴 telemetry를 건너뛴다
 
-        # 온도 감시는 **위 try 밖**에서 부른다. 안에 두면 온도 읽기 실패가
-        # 통신 두절로 오인돼 _fail 이 올라가고 엉뚱하게 재연결을 시도한다.
+        # 유휴 전류·전압 감시는 위치 폴링 실패 집계와 분리한다.
         try:
             self._guard(st)
         except Exception as e:
             self._safety_fault('유휴 안전 감시 실패', e)
 
     def _guard(self, st):
-        """과열 감시 — 온도 경로만 등급형 (2026-08-20 재설계, 15차 리뷰 반영).
+        """유휴 전류·전압 감시. 온도 레지스터는 읽지 않는다.
 
-        사다리: 62°C 이동정지(토크 유지)+⛔🔥 경보 → 상승 확인 시 ⛔🔥 재경보 →
-        65°C 펌웨어 과온(Protective_Torque 20% 유지)이 실제 컷을 맡는다.
-        소프트웨어는 토크를 끊지 않는다 — 임의 자세 0% 컷은 낙하 사고고(실측:
-        래치 오독 77°C 낙하) 펌웨어 컷(20% 유지력)이 더 안전하다(15차 M2①).
-        ★ 과전류 경로는 등급화 대상이 아니다 — 눌린 팔은 즉시 컷이 맞다.
-        ★ 메시지의 ⛔ 접두사는 클라이언트 감시(bail)와의 계약 — 빼면
-          pick_demo/park/unfold 가 과열 정지를 모른 채 계속 명령한다(15차 M1).
+        이동 중에는 더 짧은 주기로 Present_Current와 위치 정체를 검사한다.
+        과전류는 즉시 토크를 끊고, 유휴 감시 패킷 실패는 이동 자격을 폐기한다.
+        서보 자체 EEPROM 과온 보호는 이 소프트웨어 판독과 별도로 유지된다.
         """
         if self._torque_confirmed_off(st):
             return
         now = time.monotonic()
-        if now - getattr(self, '_temp_t', 0.0) < TEMP_SEC:
+        last_guard = float(getattr(self, '_guard_telemetry_t', 0.0) or 0.0)
+        # 0.0은 "아직 한 번도 감시하지 않음" sentinel이다. 프로세스가 매우
+        # 빨리 기동해 monotonic()<주기인 경우에도 최초 fail-closed 판독을 생략하지 않는다.
+        if last_guard > 0.0 and now - last_guard < GUARD_TELEMETRY_SEC:
             return
-        self._temp_t = now
-        self._temp_n = getattr(self, '_temp_n', 0) + 1
+        self._guard_telemetry_t = now
         try:
-            temps = {}
-            for m in ALL:
-                value = self._number(
-                    self.bus.read('Present_Temperature', m, normalize=False),
-                    f'{m} temperature')
-                if value > 90:
-                    value = self._number(
-                        self.bus.read('Present_Temperature', m, normalize=False),
-                        f'{m} temperature retry')
-                    if value > 90:
-                        raise ValueError(f'{m} 반복 온도 이상치 {value}°C')
-                temps[m] = value
             curs = {m: abs(self._number(
-                self.bus.read('Present_Current', m, normalize=False),
-                f'{m} current')) for m in ALL}
+                self._guard_read('Present_Current', m),
+                f'{m} current')) for m in ARM}
         except Exception as e:
-            self._safety_fault('온도·전류 안전 감시 읽기 실패', e)
+            self._safety_fault('전류 안전 감시 읽기 실패', e)
             return
         # 입력 전압(0.1V 단위) — 급사 원인 계측 (2026-08-20 밤): 체인 접촉
         # 불량 가설의 직접 증거는 침묵 직전의 전압 처짐이다. 체인 양끝(첫
         # 서보·그리퍼)만 읽어 비용을 줄인다.
         try:
             volts = {m: self._number(
-                self.bus.read('Present_Voltage', m, normalize=False),
-                f'{m} voltage') / 10.0 for m in ('shoulder_pan', 'gripper')}
+                self._guard_read('Present_Voltage', m),
+                f'{m} voltage') / 10.0 for m in ('shoulder_pan', 'wrist_roll')}
         except Exception as e:
             self._safety_fault('전압 안전 감시 읽기 실패', e)
             return
         with self.lock:
-            # ✎ 2026-08-24 '직전 값 유지' 패치 철회 — 온도 레지스터 래치
-            # 글리치(실물 차가운데 68 고정)가 눌러앉아 거짓 비상을 만들었다.
-            # 판독된 값만 그대로 노출한다.
-            self.state['temp'] = temps
+            self.state['temp'] = {}
+            self.state['temperature_monitoring'] = False
             if curs:
                 self.state['current'] = curs
             if volts:
@@ -2694,46 +3219,29 @@ class Worker(threading.Thread):
         if hot_i:
             self._kill_torque(f'과전류 자동 정지 — {hot_i} (임계 {CURRENT_STOP})')
             return
-        hot = {m: t for m, t in temps.items() if t >= TEMP_STOP}
-        warm = {m: t for m, t in temps.items() if TEMP_WARN <= t < TEMP_STOP}
-        if hot:
-            prev = getattr(self, '_hot_first', None)
-            if prev is None:
-                # ★ 단발 판독으로는 개입하지 않는다 — 그리퍼 122°C 순간 글리치가
-                # 방출 중 개방을 중단시켰다(2026-08-20 데모 실측). 같은 모터가
-                # 연속 2회(8초 간격) 뜨거워야 1단계 진입. 진짜 과열이어도 이
-                # 지연은 펌웨어 65°C 백스톱이 받친다.
-                pend = getattr(self, '_hot_pending', {})
-                self._hot_pending = dict(hot)
-                confirmed = {m: t for m, t in hot.items() if m in pend}
-                if not confirmed:
-                    self.say(f'⚠ 과열 의심(1회 판독) {hot} — 다음 판독으로 확인')
-                    return
-                hot = confirmed
-                reason = f'확인된 과열 {hot}'
-                try:
-                    stopped = self._latch_and_apply_stop(
-                        reason, hot_gripper='gripper' in hot)
-                except Exception as e:
-                    stopped = False
-                    self._kill_torque(f'🔥 과열 정지 실패({type(e).__name__}) — {hot}')
-                if not stopped:
-                    return
-                self._hot_first = dict(hot)     # 정지 성공 후에만 (15차 M3)
-                self.say(f'⛔🔥 과열 감지 — 이동 정지·자세 유지 {hot} (임계 '
-                         f'{TEMP_STOP}°C). 65°C 면 펌웨어가 유지력 20%로 줄입니다')
-            elif any(t >= prev.get(m, TEMP_STOP) + 2 for m, t in hot.items()):
-                if self._temp_n % 2 == 0:
-                    self.say(f'⛔🔥 과열 진행(상승 확인) {hot} — 팔을 받칠 준비. '
-                             f'65°C 펌웨어 보호(유지력 20%)가 컷을 맡습니다')
-            elif self._temp_n % 4 == 0:
-                self.say(f'⛔🔥 과열 판독 유지 {hot} — 비상승(오독 가능성). 정지 '
-                         f'상태 유지 중, 전원 리셋으로 레지스터 초기화 검토')
-        else:
-            self._hot_first = None
-            self._hot_pending = {}
-            if warm and self._temp_n % 4 == 0:
-                self.say(f'⚠ 서보 온도 상승: {warm}')
+
+    def _guard_read(self, register, motor):
+        """안전 telemetry를 짧게 재시도하되 연속 실패는 그대로 올린다.
+
+        실기에서 말단 집게 장치가 정상적으로 큐브를 문 직후 ID 6의 전류 패킷
+        한 장만 빠져 전체 파지가 취소됐다. 최대 30ms 안에서 두 번 더 읽으면
+        단일 RxPacketError는 흡수하고, 실제 버스 단절은 세 번째 실패에서 기존
+        ``_safety_fault`` 경로로 들어가므로 과전류 fail-closed 계약은 유지한다.
+        """
+        last = None
+        for attempt in range(GUARD_READ_ATTEMPTS):
+            try:
+                value = self.bus.read(register, motor, normalize=False)
+            except Exception as exc:
+                last = exc
+                if attempt + 1 < GUARD_READ_ATTEMPTS:
+                    time.sleep(GUARD_READ_RETRY_SEC)
+                    continue
+                raise
+            if attempt:
+                self.say(f'⚠ {motor} {register} 판독 {attempt}회 재시도 후 복구')
+            return value
+        raise last or RuntimeError(f'{motor} {register} 판독 실패')
 
     def _relieve_gripper_overheat(self):
         """그리퍼 압착 목표 hold를 증명하고, 실패하면 해당 축만 exact OFF한다."""
@@ -2787,12 +3295,19 @@ class Worker(threading.Thread):
 
     def cam_snapshot(self):
         """카메라 축별 현재 raw·기준각·이탈 여부. 못 읽으면 None."""
+        if not self._camera_axes_enabled():
+            return {'enabled': False, 'home': None, 'axes': {}, 'at_home': None}
         try:
             home = (json.loads(CAM_CALIB.read_text()).get('home')
                     if CAM_CALIB.exists() else None)
-        except Exception:
+        except Exception as exc:
             home = None
+            home_error = f'{type(exc).__name__}: {exc}'
+        else:
+            home_error = None
         out = {'home': home, 'axes': {}, 'at_home': None}
+        if home_error:
+            out['home_error'] = home_error
         try:
             for name, sid in CAM.items():
                 raw = int(self._cam_read('Present_Position', sid))
@@ -2813,6 +3328,10 @@ class Worker(threading.Thread):
     def _camera_motion_cancelled(self, epoch):
         return (self.abort.is_set() or self._stop_latched.is_set()
                 or (epoch is not None and epoch != self._actuation_epoch))
+
+    def _camera_axes_enabled(self):
+        """차량 손목캠 전용 프로필에서는 폐기한 뎁스캠 팬/틸트를 건너뛴다."""
+        return not (self.profile and self.profile.get('camera_axes_enabled') is False)
 
     def _camera_maintenance_blocked(self):
         """Worker camera actuation은 dirty recovery 권한을 갖지 않는다."""
@@ -2848,6 +3367,9 @@ class Worker(threading.Thread):
 
     def _do_cam_home(self):
         """기준각으로 복귀 — 정합이 유효한 자세로. 나눠 가며 부하를 본다."""
+        if not self._camera_axes_enabled():
+            return self._reject_motion(
+                '카메라 팬/틸트 이동 거부 — 차량 손목캠 전용 프로필에서 비활성')
         epoch = self._active_command_epoch
         if not self._camera_motion_checkpoint(epoch):
             return None
@@ -2904,6 +3426,9 @@ class Worker(threading.Thread):
 
     def _do_cam_move(self, axis, delta_deg):
         """상대 이동 [°] — 캘리브·겨냥 조정용. 상한을 넘으면 거부한다."""
+        if not self._camera_axes_enabled():
+            return self._reject_motion(
+                '카메라 팬/틸트 이동 거부 — 차량 손목캠 전용 프로필에서 비활성')
         try:
             delta_deg = self._number(delta_deg, 'camera delta_deg')
         except ValueError as e:
@@ -2972,7 +3497,7 @@ class Worker(threading.Thread):
         with self.lock:
             self._shutdown_started = True
         deadline = time.monotonic() + timeout
-        stop_id, _cancelled = self._request_stop(reason)
+        stop_id, _cancelled = self._request_stop(reason, source='shutdown')
         if self.is_alive():
             stop_result = self.wait_command(
                 stop_id, max(0.0, deadline - time.monotonic()))

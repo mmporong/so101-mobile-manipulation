@@ -16,6 +16,7 @@ import pathlib
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
@@ -61,6 +62,8 @@ class FakeArm:
         self.move_seq = 0
         self.last_done = None
         self.state_gets = 0
+        self.command_seq = 0
+        self.commands = {}
 
 
 def make_handler(arm):
@@ -77,7 +80,8 @@ def make_handler(arm):
             self.wfile.write(b)
 
         def do_GET(self):
-            if self.path == '/state':
+            parsed = urlsplit(self.path)
+            if parsed.path == '/state':
                 arm.state_gets += 1
                 if arm.halt_after and arm.state_gets > arm.halt_after:
                     log = ['⛔ 테스트 거부']
@@ -86,9 +90,19 @@ def make_handler(arm):
                 else:
                     log = []
                 self._json({'connected': True, 'calibrated': True,
-                            'torque': True, 'pos': dict(arm.pos), 'log': log,
+                            'torque': True, 'torque_state': 'on',
+                            'safety_ready': True, 'safety_reason': 'test',
+                            'stop_latched': False,
+                            'base_interlock_active': True,
+                            'base_interlock_reason': 'test',
+                            'pos': dict(arm.pos), 'log': log,
                             'speed_pct': 20})
-            elif self.path == '/blob':
+            elif parsed.path == '/command':
+                command_id = (parse_qs(parsed.query).get('id') or [None])[0]
+                command = arm.commands.get(command_id)
+                self._json(command if command else {'error': 'not found'},
+                           200 if command else 404)
+            elif parsed.path == '/blob':
                 self._json({'blob': getattr(arm, 'blob', None)})
             else:
                 self._json({}, 404)
@@ -99,6 +113,8 @@ def make_handler(arm):
             arm.ops.append((d.get('op'), {k: v for k, v in d.items()
                                           if k != 'op'}))
             op = d.get('op')
+            response = {'ok': True}
+            worker_op = op
             if op == 'ik':
                 bf = tuple(p + o for p, o in
                            zip((d['x'], d['y'], d['z']), arm_lib.PAN0))
@@ -118,13 +134,34 @@ def make_handler(arm):
                     arm.move_seq += 1
                     arm.last_done = (f'이동 완료 — 전류피크 모의 #{arm.move_seq} '
                                      f'(임계 250)')
-                self._json({'ok': True, 'q': list(q)})
+                response['q'] = list(q)
+                worker_op = 'move_q'
             elif op == 'goto':
                 if not (arm.ignore_gripper and d['joint'] == 'gripper'):
                     arm.pos[d['joint']] = float(d['value'])
-                self._json({'ok': True})
-            else:
-                self._json({'ok': True})
+            elif (op == 'jog' and d.get('joint') == 'shoulder_pan'
+                  and getattr(arm, 'grasp_verdict', None) == 'follow'
+                  and getattr(arm, 'blob', None)):
+                arm.blob['u'] = float(arm.blob['u']) + 4.0 * float(d['delta'])
+            elif (op == 'jog' and d.get('joint') == 'shoulder_pan'
+                  and getattr(arm, 'grasp_verdict', None) == 'missing'):
+                arm.blob = None
+            arm.command_seq += 1
+            command_id = f'fake-{arm.command_seq}'
+            reject_later = bool(arm.halt_after and op == 'ik'
+                                and len([name for name, _ in arm.ops
+                                         if name == 'ik']) >= arm.halt_after)
+            arm.commands[command_id] = {
+                'id': command_id, 'op': worker_op,
+                'status': 'rejected' if reject_later else 'completed',
+                'epoch': 0,
+                'applied_action': (None if reject_later else {
+                    'op': worker_op, 'simulated': True}),
+                'reason': '테스트 거부' if reject_later else None,
+            }
+            response.update({'command_id': command_id, 'status': 'accepted',
+                             'reason': None})
+            self._json(response)
     return Hd
 
 
@@ -209,7 +246,7 @@ def main():
 
     print('⑦ 이동 중 ⛔ → bail (리뷰 M6)')
     arm = run_case('거부중단', (0.19, 0.02, 0.02), 2.5, [],
-                   expect_exit=True, expect_sub='1', halt_after=1)
+                   expect_exit=True, expect_sub='IK 이동 실패', halt_after=1)
     assert [o for o, _ in arm.ops][-1] == 'stop', 'bail 의 stop 미발행'
     assert len([o for o, _ in arm.ops if o == 'ik']) <= 1, '⛔ 후에도 이동 계속!'
 

@@ -26,6 +26,7 @@ lift 를 **먼저** -110° 로 내리면 곧게 선 팔이 뒤로 세워지며 �
 사용: python3 park.py        (서버 8765 필요, 토크 ON 상태에서)
 """
 import json
+import argparse
 import pathlib
 import sys
 import time
@@ -68,7 +69,12 @@ def bail(msg):
     sys.exit(1)
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        '--mission-managed', action='store_true',
+        help='연속 미션이 최종 정지를 담당할 때 운영자 STOP 재전송 생략')
+    args = ap.parse_args(argv)
     park = arm_lib.load_mapping().get('park_deg')
     if not park:
         sys.exit('mapping.json 에 park_deg 가 없습니다')
@@ -181,8 +187,9 @@ def main():
             if prev is not None and gn is not None and abs(gn - prev) < 0.3:
                 break
             prev = gn
-    post('stop')
-    time.sleep(0.5)
+    if not args.mission_managed:
+        post('stop')
+        time.sleep(0.5)
     post('torque', on=False)              # 파킹 자세 도달 후에만 — 자중 안정
     time.sleep(1.5)
     fin = state()['pos']

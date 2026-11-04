@@ -52,11 +52,11 @@
       <geom name="piece_cyl_body" type="cylinder" size="0.001 0.001"/>
     </body>
     <body name="dropbox" mocap="true">
-      <geom name="box_bottom" type="box" size="0.04 0.04 0.002"/>
-      <geom name="box_wall_y1" type="box" size="0.04 0.004 0.001"/>
-      <geom name="box_wall_y2" type="box" size="0.04 0.004 0.001"/>
-      <geom name="box_wall_x1" type="box" size="0.004 0.032 0.001"/>
-      <geom name="box_wall_x2" type="box" size="0.004 0.032 0.001"/>
+      <geom name="box_bottom" type="box" size="0.06 0.06 0.002" rgba="0.56 0.32 0.16 1"/>
+      <geom name="box_wall_y1" type="box" size="0.06 0.003 0.001" rgba="0.56 0.32 0.16 1"/>
+      <geom name="box_wall_y2" type="box" size="0.06 0.003 0.001" rgba="0.56 0.32 0.16 1"/>
+      <geom name="box_wall_x1" type="box" size="0.003 0.054 0.001" rgba="0.56 0.32 0.16 1"/>
+      <geom name="box_wall_x2" type="box" size="0.003 0.054 0.001" rgba="0.56 0.32 0.16 1"/>
     </body>
   </worldbody>
 </mujoco>

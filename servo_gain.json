@@ -20,14 +20,36 @@
   "floor_note": "2026-08-26 차량 프로필. 받침대 상판 160mm와 어깨 기준 78mm를 반영한 pan 축 기준 작업면 z=-0.238m. 차량 장착·받침대·캘리브레이션이 바뀌면 probe_floor.py로 재확인할 것. Astra/depth 측정은 차량 활성 경로에서 사용하지 않는다.",
   "vehicle_geometry": {
     "platform_height_m": 0.16,
-    "piece_xy_m": [0.19, 0.0],
-    "piece_heights_m": {"cube": 0.02, "lying": 0.011, "standing": 0.035},
+    "piece_xy_m": [
+      0.19,
+      0.0
+    ],
+    "piece_heights_m": {
+      "cube": 0.02,
+      "lying": 0.011,
+      "standing": 0.035
+    },
     "shoulder_above_platform_m": 0.078,
     "floor_expect_half_width_m": 0.012,
     "probe_start_clearance_m": 0.05,
     "probe_limit_below_floor_m": 0.012,
-    "box_xy_m": [0.042, -0.142],
-    "box_rim_height_m": 0.065,
+    "drop_box": {
+      "measured_size_m": [
+        0.12,
+        0.12
+      ],
+      "safe_release_size_m": [
+        0.1,
+        0.1
+      ],
+      "rim_height_m": 0.06,
+      "pose_source": "wrist_rgb_live",
+      "size_note": "2026-09-01 실측: 가로 120mm, 세로 120mm, 높이 60mm. 별도 내·외부 치수는 없으며 safe_release_size_m은 가장자리에서 10mm씩 뺀 소프트웨어 방출 여유 영역이다."
+    },
+    "simulation_dropbox_xy_m": [
+      0.042,
+      -0.142
+    ],
     "drop_transit_clearance_m": 0.048,
     "drop_release_clearance_m": 0.023
   },
@@ -86,9 +108,7 @@
   ],
   "grasp_teach_note": "2026-08-20 교시: 사용자가 물체를 죠 입 안에 직접 배치한 상태에서 실측. grasp_xy_offset_m = 뎁스캠 광선∩평면 추정 - TCP (파지 목표 = 추정 - 오프셋). wrist_grasp_target_px = 그때 손목캠 블롭 픽셀 (z=floor+0.010, 입 안·닫기 전) — 비주얼 서보 목표. 카메라·정합 변경 시 재교시.",
   "arm_port_id": {
-    "vendor_id": "1a86",
-    "model_id": "55d3",
-    "serial": "5B3E088747"
+    "serial_id": "1a86_USB_Single_Serial_5B3E088747"
   },
   "arm_port_note": "2026-08-21 자동 학습: 연결에 성공한 어댑터의 udev 신원. 자동 포트 선택은 이 신원과 맞는 장치만 고른다 — 팔이 꺼져 있을 때 남의 USB-시리얼을 잡는 사고 방지. 어댑터를 교체하면 이 키를 지울 것.",
   "cam_servo_note": "뎁스캠 팬=ID 7 · 틸트=ID 8 (2026-08-21 재번호). 팔과 같은 버스라 1~6 과 겹치면 안 된다. 각도를 바꾸면 handeye.json 이 무효가 되므로 재정합하거나 정합 시점 각도로 되돌릴 것.",
@@ -122,15 +142,15 @@
   "wrist_y_to_px": 2818.3,
   "wrist_y_note": "2026-08-21 재측정 — 좌우(y) 이동 → 손목캠 **세로(cy)** 변화. 표본 5 · 최대 잔차 7.5px · 구간 이득 1900~3542 로 원근 때문에 커진다(폐루프는 부호만 맞으면 수렴). 캠 회전 장착이라 가로(cx)는 비단조 — 쓰면 안 된다.",
   "wrist_ref_px": [
-    96.4,
-    190.1
+    129.8,
+    216.4
   ],
-  "wrist_ref_note": "2026-08-21: 죠가 물체를 문 상태의 손목캠 blob. 폐루프는 이 값에 맞춘다. 픽셀·면적·TCP·각도를 한 세트로 저장한다 — 따로 갱신하면 서로 다른 물린 상태를 가리켜 파지가 어긋난다. 캠·해상도가 바뀌면 재측정.",
-  "wrist_ref_area": 26747.0,
+  "wrist_ref_note": "2026-08-31 차량 재교시. 말단 집게 장치가 열린 상태에서 접촉 전 픽셀·면적·TCP를 측정한 뒤 천천히 닫아 실제 파지를 확인했다. 닫힌 화면은 물체 가림으로 blob 중심이 달라지므로 기준에 쓰지 않았다.",
+  "wrist_ref_area": 12742.0,
   "wrist_ref_tcp": [
-    0.1877,
-    0.0506,
-    -0.2331
+    0.1796,
+    0.0488,
+    -0.2106
   ],
   "wrist_jac": {
     "dcx_dx": -2217.0,
@@ -139,17 +159,17 @@
     "dcy_dy": 2818.0
   },
   "wrist_jac_note": "2026-08-21 실측 — 손목캠 픽셀이 팔 x·y 에 어떻게 반응하는가. x→cx -2217 px/m (잔차 3.8px) · x→cy +1198 · y→cy +2818. dcx_dy 는 y 스윕에서 비단조라 근사값이다. 면적으로 전후를 잡던 방식은 가림·각도에 요동해(5542~11590) 못 쓴다 — 이 야코비안을 역으로 풀면 한 걸음에 정렬된다. pick_red 의 옛 주석 \"x 1m → blob_x +8px\" 은 캠이 옮겨져 무효.",
-  "wrist_ref_grip": 44.2,
-  "wrist_ref_axis_deg": 85.9,
+  "wrist_ref_grip": 44.3,
+  "wrist_ref_axis_deg": 84.2,
   "wrist_ref_axis_note": "2026-08-21: 물린 자세에서 손목캠에 보인 물체 각도 [0,90). 손목캠은 죠에 붙어 있으므로 이것이 곧 \"죠 닫힘축에 정렬된 각도\"다. 파지 전에 이 값과의 차이로 물체가 죠에 비스듬한지 판정한다 — 45° 로 돌아간 4cm 큐브는 대각선 5.7cm 라 죠에 안 들어간다.",
   "wrist_obs_px": [
-    168.7,
-    171.1
+    147.1,
+    209.8
   ],
-  "wrist_obs_z": -0.1691,
-  "wrist_obs_area": 14588,
-  "wrist_obs_note": "차량 장착 재교시 2026-08-26 — 상판 160mm + 어깨 78mm 기준",
-  "wrist_obs_axis_deg": 82.7,
+  "wrist_obs_z": -0.1732,
+  "wrist_obs_area": 16770.0,
+  "wrist_obs_note": "2026-08-31 차량 재교시. 큐브에 접촉하기 전에 파지 지점의 작업대에 둔 채 팔만 수직으로 관찰 높이까지 올렸다. 면적 비 1.32. 파지 뒤 다시 놓을 때 큐브가 흔들린 위치는 기준에 쓰지 않았다.",
+  "wrist_obs_axis_deg": 84.2,
   "wrist_roll_axis_slope": 0.735,
   "wrist_roll_note": "2026-08-24 실측 — 손목 롤 +8° 가 화면 각도를 얼마나 돌리는가. 롤 보정 파지: roll = -각도차/기울기. 캠 장착이 바뀌면 재측정.",
   "wrist_jac_radial": {
@@ -162,5 +182,6 @@
       0.891
     ]
   },
-  "wrist_jac_radial_note": "팬 잠금(차량 장착) 전용 — 팔이 향한 직선 위 이동에 대한 픽셀 반응. 2026-08-26 측정"
+  "wrist_jac_radial_note": "팬 잠금(차량 장착) 전용 — 팔이 향한 직선 위 이동에 대한 픽셀 반응. 2026-08-26 측정",
+  "wrist_hold_verify_grip": 10.5
 }

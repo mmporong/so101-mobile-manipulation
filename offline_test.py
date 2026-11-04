@@ -22,9 +22,12 @@ CORE = [
     'test_stream_contract.py', 'test_recorder_lifecycle.py',
     'test_c1_control.py',
     'test_stop_velocity.py', 'test_place_down.py', 'test_drop_to_box.py',
+    'test_box_vision.py', 'test_mobile_mission.py',
     'test_pick_wrist.py', 'test_pick_demo.py', 'test_park_path.py',
     'test_unfold_path.py', 'test_laptop_deployment.py', 'test_ds_record.py',
     'test_e2e_handeye.py', 'sim/test_sim_mirror.py',
+    'test_surface_profiles.py', 'test_metric_vision.py',
+    'test_surface_profile_integration.py', 'test_wrist_extrinsics.py',
 ]
 CI = [
     'test_vehicle_profile.py', 'test_base_interlock.py', 'test_core_safety.py',
@@ -36,16 +39,24 @@ CI = [
     'test_owned_bus_session.py',
     'test_entrypoint_authority.py',
     'test_stream_contract.py', 'test_recorder_lifecycle.py',
-    'test_stop_velocity.py', 'test_unfold_path.py', 'test_laptop_deployment.py',
+    'test_stop_velocity.py', 'test_box_vision.py', 'test_mobile_mission.py',
+    'test_unfold_path.py', 'test_laptop_deployment.py',
     'sim/test_sim_mirror.py',
+    'test_surface_profiles.py', 'test_metric_vision.py',
+    'test_surface_profile_integration.py', 'test_wrist_extrinsics.py',
 ]
+PYTEST_TESTS = {
+    'test_surface_profiles.py', 'test_metric_vision.py',
+    'test_surface_profile_integration.py', 'test_wrist_extrinsics.py',
+}
 
 
 def static_checks():
     for path in HERE.rglob('*.py'):
         if '.omx' not in path.parts:
             ast.parse(path.read_text(), filename=str(path))
-    for name in ('servo_gain.json', 'car_limits.json', 'mapping.json'):
+    for name in ('servo_gain.json', 'car_limits.json', 'mapping.json',
+                 'surface_profiles.json', 'wrist_camera_calibration.example.json'):
         json.loads((HERE / name).read_text())
     ET.parse(HERE / 'sim/scene_mirror.xml')
     for name in ('run_batch.sh', 'run_demo.sh', 'laptop_ros_env.sh'):
@@ -75,7 +86,10 @@ def main(argv=None):
             candidate = pathlib.Path.home() / 'miniforge3/envs/rlwalk/bin/python'
             if candidate.exists():
                 python = str(candidate)
-        subprocess.run([python, str(HERE / name)], cwd=HERE,
+        command = ([python, '-m', 'pytest', '-q', str(HERE / name)]
+                   if name in PYTEST_TESTS
+                   else [python, str(HERE / name)])
+        subprocess.run(command, cwd=HERE,
                        check=True, timeout=120)
         print(f'--- {name}: {time.monotonic()-test_started:.2f}초', flush=True)
     print(f'\nPASS — 오프라인 {len(tests)}개 · {time.monotonic()-started:.1f}초')

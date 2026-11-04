@@ -505,6 +505,7 @@ def test_worker_client_waits_for_matching_terminal_applied_action():
         return JsonResponse(next(statuses))
 
     with mock.patch.object(arm_lib.urllib.request, 'urlopen', urlopen), \
+            mock.patch.object(arm_lib, '_EXECUTE_ENABLED', True), \
             mock.patch.object(arm_lib.time, 'sleep', lambda _seconds: None):
         terminal = arm_lib.worker_submit_wait(
             'ik', x=0.2, y=0.0, z=-0.1, require_applied=True,
@@ -529,7 +530,8 @@ def test_worker_client_rejects_stopped_epoch_without_followup_write():
             'id': 'cmd-old', 'op': 'jog', 'status': 'rejected', 'epoch': 4,
             'applied_action': None, 'reason': '명령 actuation epoch 만료'})
 
-    with mock.patch.object(arm_lib.urllib.request, 'urlopen', urlopen):
+    with mock.patch.object(arm_lib.urllib.request, 'urlopen', urlopen), \
+            mock.patch.object(arm_lib, '_EXECUTE_ENABLED', True):
         try:
             arm_lib.worker_submit_wait(
                 'jog', joint='shoulder_lift', delta=1.0,
@@ -539,6 +541,72 @@ def test_worker_client_rejects_stopped_epoch_without_followup_write():
         else:
             raise AssertionError('STOP 이전 epoch 명령이 성공 처리됨')
     assert sum(url.endswith('/cmd') for url in calls) == 1
+
+
+def test_worker_client_uses_server_wait_budget_and_preserves_timeout_status():
+    statuses = iter((
+        {'id': 'cmd-budget', 'op': 'move_q', 'status': 'executing',
+         'epoch': 8, 'recommended_wait_timeout_s': 60.0,
+         'target_joints_deg': {'wrist_roll': 48.2},
+         'applied_action': None, 'reason': None},
+        {'id': 'cmd-budget', 'op': 'move_q', 'status': 'completed',
+         'epoch': 8, 'recommended_wait_timeout_s': 60.0,
+         'actual_duration_s': 31.2,
+         'applied_action': {'wrist_roll': 48.1}, 'reason': None},
+    ))
+
+    def urlopen(request, timeout):
+        url = request.full_url if hasattr(request, 'full_url') else str(request)
+        if url.endswith('/cmd'):
+            return JsonResponse({'ok': True, 'command_id': 'cmd-budget'})
+        return JsonResponse(next(statuses))
+
+    with mock.patch.object(arm_lib.urllib.request, 'urlopen', urlopen), \
+            mock.patch.object(arm_lib, '_EXECUTE_ENABLED', True), \
+            mock.patch.object(arm_lib.time, 'sleep', lambda _seconds: None):
+        terminal = arm_lib.worker_submit_wait(
+            'ik', wait_timeout=0.01, expected_worker_op='move_q')
+    assert terminal['actual_duration_s'] == 31.2
+
+    executing = {
+        'id': 'cmd-timeout', 'op': 'move_q', 'status': 'executing',
+        'epoch': 9, 'recommended_wait_timeout_s': None,
+        'target_joints_deg': {'wrist_roll': 48.2},
+        'applied_action': None, 'reason': None,
+    }
+
+    def timeout_urlopen(request, timeout):
+        url = request.full_url if hasattr(request, 'full_url') else str(request)
+        if url.endswith('/cmd'):
+            return JsonResponse({'ok': True, 'command_id': 'cmd-timeout'})
+        return JsonResponse(executing)
+
+    with mock.patch.object(arm_lib.urllib.request, 'urlopen', timeout_urlopen), \
+            mock.patch.object(arm_lib, '_EXECUTE_ENABLED', True), \
+            mock.patch.object(arm_lib.time, 'monotonic', side_effect=(0.0, 0.0, 0.2)), \
+            mock.patch.object(arm_lib.time, 'sleep', lambda _seconds: None):
+        try:
+            arm_lib.worker_submit_wait(
+                'ik', wait_timeout=0.1, expected_worker_op='move_q')
+        except arm_lib.WorkerCommandError as exc:
+            assert exc.command_id == 'cmd-timeout'
+            assert exc.status == executing
+            assert exc.as_dict()['command_status']['status'] == 'executing'
+        else:
+            raise AssertionError('executing 명령 timeout을 성공 처리함')
+
+
+def test_worker_client_dry_run_rejects_before_any_http_request():
+    # 기본 차단을 유지하고, 통신 계약 테스트만 모의 실행 허용 상태를 사용한다.
+    with mock.patch.object(arm_lib, '_EXECUTE_ENABLED', False), \
+            mock.patch.object(arm_lib.urllib.request, 'urlopen') as request:
+        try:
+            arm_lib.worker_submit_wait('ik', x=0.2, y=0.0, z=-0.1)
+        except arm_lib.MotionNotApprovedError:
+            pass
+        else:
+            raise AssertionError('dry-run이 이동 요청을 허용함')
+        request.assert_not_called()
 
 
 def main():
@@ -553,8 +621,10 @@ def main():
              test_leader_raising_and_silent_close_retain_every_reference_and_block_reopen,
              test_leader_partial_open_with_silent_close_is_nonzero_and_retained,
              test_direct_follower_api_is_rejected_before_hardware_import,
+             test_worker_client_dry_run_rejects_before_any_http_request,
              test_worker_client_waits_for_matching_terminal_applied_action,
-             test_worker_client_rejects_stopped_epoch_without_followup_write]
+             test_worker_client_rejects_stopped_epoch_without_followup_write,
+             test_worker_client_uses_server_wait_budget_and_preserves_timeout_status]
     for test in tests:
         test()
         print(f'  PASS {test.__name__}')

@@ -156,19 +156,7 @@ def main():
     print(f'휴지 완료 — TCP ({fx:+.3f},{fy:+.3f},{fz:+.3f}), 책상 위 '
           f'{1000*(fz-floor):.0f}mm, 토크 ON 유지. 전원을 뽑아도 침하는 '
           f'{1000*REST_HOVER:.0f}mm 이내.')
-    # 물체가 실제로 놓였는지 뎁스캠 최종 확인 (실패해도 치명 아님 — 보고만)
-    try:
-        import json as _json
-        he = _json.loads((pathlib.Path(__file__).parent / 'handeye.json')
-                         .read_text())
-        import numpy as np
-        loc = pd.locate(np.array(he['R']), np.array(he['t']), floor, h_center)
-        if loc:
-            print(f'물체 최종 위치(뎁스캠): ({loc[0]:+.3f}, {loc[1]:+.3f})')
-        else:
-            print('물체 최종 위치: 뎁스캠 미검출 (시야 확인)')
-    except Exception as e:
-        print(f'물체 최종 확인 생략: {e}')
+    print('물체 최종 위치는 손목 RGB 또는 육안으로 확인합니다 (depth 비활성).')
 
 
 if __name__ == '__main__':

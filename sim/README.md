@@ -39,9 +39,10 @@ cd ~/so101-mobile-manipulation/sim
   120mm 이내이거나, 죠 폭이 6~25 구간에서 0.8 미만 변화로 정착하면 파지로
   본다. 물체를 팬 축 기준 방사 방향으로 부착하고, 방출 순간에는 그 자리 수직
   아래 작업면까지 떨어뜨린다.
-- **투하 상자**: 검은 개방형 8×8cm × 높이 6.5cm(2026-08-20 저녁 교체 —
-  최초 13cm 정육면체 아님), 방출 지점 패널 (0.042, −0.142). `dropbox` mocap
-  몸체. 높이는 XML 절대값이 아니라 현재 작업면을 따라간다.
+- **반납 상자**: 갈색 120×120×60mm 실측(2026-09-01). 별도 내·외부 치수는
+  없으며 100×100mm는 가장자리 10mm씩을 뺀 소프트웨어 안전 방출 영역이다.
+  시뮬레이션의 벽 두께는 표시값이며 물리 제원을 뜻하지 않는다. 방출 지점 패널
+  (0.042, −0.142)의 `dropbox` mocap 몸체이고 높이는 현재 작업면을 따라간다.
 
 ## 녹화
 ```bash
@@ -53,6 +54,41 @@ ffmpeg -f mpjpeg -i http://127.0.0.1:8765/cam -t 80 -c:v libx264 -pix_fmt yuv420
 ```
 ※ `-t`는 미디어 시간 기준이라 벽시계보다 오래 돌 수 있다 — 넉넉히 걸고
 SIGINT 로 마감해도 된다. 산출물은 `~/so101-mobile-manipulation/media/<날짜>/`.
+
+## 프로파일·배치·충돌 검증
+
+`SimMirror(profile_id=..., target_id=...)`는 `table_current`와
+`ground_same_plane`, `SUPPORT_TARGET`과 `OPEN_BIN` 의미를 구분한다. 차량의
+평면 `x/y/yaw`는 표시 모델에만 반영되며 ROS·패널·실팔 명령을 만들지 않는다.
+
+- `placement_status()` — 지지면 위 배치와 열린 함 내부 투하의 서로 다른 안전
+  영역·방출 높이를 계산한다.
+- `validate_swept_clearance(samples)` — 링크·죠·카메라·파지 물체 표본을 구로
+  받아 작업면·차량 상판·반납 대상과의 signed 최소 clearance를 반환한다.
+- `test_sim_mirror.py` — 두 surface profile, 두 target policy, base planar pose,
+  충돌·배치 계약을 `rlwalk` MuJoCo 환경에서 검증한다.
+
+이 계층은 제어기가 아니라 검증기다. clearance 입력은 실제 제어 계층이 계산한
+링크/tool 표본이어야 하며, 여기서 PASS했다고 실물 이동 권한이 생기지 않는다.
+
+## 미션 기록·무동작 replay 통합 계약
+
+`MissionHistory.decision_event(...)`와 `save_debug_frame(...)`는 호출자가 넘긴
+판단 입력을 기록할 뿐 카메라·ROS·팔을 직접 읽거나 움직이지 않는다. schema v2
+event는 `seq/prev_hash/hash` 체인으로 append되며 manifest의 run/profile/
+calibration hash와 함께 `replay_mission.py --no-motion <run_dir>`에서 검증된다.
+v1은 읽을 수 있지만 결과가 `legacy_unverified`, 검증된 v2만 `verified`다.
+
+v2 `verified` 통합에는 manifest의 `profile.id`, `profile.hash`,
+`calibration.id`, `calibration.hash`가 모두 비어 있지 않은 문자열이어야 한다.
+각 `decision_event`도 같은 `profile_id/profile_hash/calibration_id/
+calibration_hash`를 반드시 기록해야 한다. manifest 없이 Python에서 event list만
+`replay(rows)`에 넘기면 hash-chain이 맞아도 `integrity_only_unverified`다.
+
+현재 `mobile_mission.py` 호출 연결은 이 API의 소비자가 담당한다. 연결 전에는
+새 structured decision/debug ring이 자동으로 생성되지 않으며, 기존 실패 미션의
+전체 영상 미보존 정책은 그대로 유지된다. replay는 저장된 판단 입력과 정책을
+재계산하며 raw 이미지에서 CV/PnP를 다시 수행하지 않는다.
 
 ## 새 기기 세팅
 메시는 강의 자료를 심링크로 쓴다 (리포에는 미포함):

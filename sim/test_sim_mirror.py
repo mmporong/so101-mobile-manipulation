@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """차량 장착 SO-101 MuJoCo 미러를 실물·카메라 없이 검증한다."""
+import dataclasses
 import math
 import pathlib
 import sys
@@ -154,25 +155,39 @@ def main():
     geometry = arm_lib.vehicle_geometry()
     assert close(sim_core.PLATFORM_HEIGHT_M, geometry['platform_height_m'])
     assert np.allclose(sim_core.DEFAULT_PIECE_XY, geometry['piece_xy_m'])
-    assert np.allclose(sim_core.DROPBOX_XY, geometry['box_xy_m'])
+    assert np.allclose(sim_core.DROPBOX_XY,
+                       geometry['simulation_dropbox_xy_m'])
     xml = (D / 'scene_mirror.xml').read_text()
     assert 'apply_vehicle_geometry' in xml
     assert '0.156' not in xml and '0.074' not in xml and '0.0325' not in xml
     top = sim.model.geom('platform_top')
     post = sim.model.geom('platform_post_fl')
     cube = sim.model.geom('piece_body')
+    bottom = sim.model.geom('box_bottom')
     wall = sim.model.geom('box_wall_y1')
+    side = sim.model.geom('box_wall_x1')
     assert close(top.pos[2] + top.size[2], geometry['platform_height_m'])
     assert close(post.pos[2] + post.size[1], geometry['platform_height_m'] - 0.004)
     assert close(cube.size[2], geometry['piece_heights_m']['cube'])
+    assert np.allclose(bottom.size[:2] * 2,
+                       geometry['drop_box']['measured_size_m'])
+    assert close(wall.pos[1] + wall.size[1],
+                 geometry['drop_box']['measured_size_m'][1] / 2)
+    assert close(side.pos[0] + side.size[0],
+                 geometry['drop_box']['measured_size_m'][0] / 2)
     assert close(wall.size[2] * 2, geometry['box_rim_height_m'])
     alternate = dict(geometry)
     alternate['platform_height_m'] = 0.19
     alternate['piece_heights_m'] = dict(geometry['piece_heights_m'], cube=0.025)
     alternate['box_rim_height_m'] = 0.08
+    alternate['drop_box'] = dict(
+        geometry['drop_box'], measured_size_m=(0.14, 0.10))
     sim_core.apply_vehicle_geometry(sim.model, sim.mj, alternate)
     assert close(top.pos[2] + top.size[2], 0.19)
     assert close(cube.size[2], 0.025)
+    assert np.allclose(bottom.size[:2] * 2, (0.14, 0.10))
+    assert close(wall.pos[1] + wall.size[1], 0.05)
+    assert close(side.pos[0] + side.size[0], 0.07)
     assert close(wall.size[2] * 2, 0.08)
     pose1 = {joint: 0.0 for joint in arm_lib.JOINTS}
     pose2 = dict(pose1, shoulder_pan=2.0)
@@ -193,7 +208,88 @@ def main():
     assert 'set_pose_deg(deg, attach=False)' in active
     print('  /blob·handeye 자동 추정 제거, 기본값/수동 교시만 사용: OK')
 
-    print('\n통과 — 차량 장착 MuJoCo 미러 9항목')
+    print('⑩ table/ground profile · 차량 평면 pose')
+    ground = sim_core.SimMirror(
+        piece='cube', scene_path=CONTRACT_SCENE,
+        profile_id='ground_same_plane')
+    assert sim.profile_id == 'table_current'
+    assert ground.profile_id == 'ground_same_plane'
+    before = np.array(ground.model.body('base').pos).copy()
+    pose = ground.set_base_pose(0.12, -0.04, 25.0)
+    after = np.array(ground.model.body('base').pos).copy()
+    assert pose == {'x_m': 0.12, 'y_m': -0.04, 'yaw_deg': 25.0}
+    assert not np.allclose(before, after), (before, after)
+    print('  profile 분리 · base x/y/yaw 표시 반영 · 실기 명령 없음: OK')
+
+    print('⑪ SUPPORT_TARGET/OPEN_BIN 배치 의미 · 충돌 clearance')
+    support = sim_core.SimMirror(
+        piece='cube', scene_path=CONTRACT_SCENE,
+        target_id='brown_support_target_120mm')
+    support.set_target((0.20, -0.10))
+    sid = support.mocap_id[support.PIECE]
+    support.data.mocap_pos[sid] = support.panel_to_sim((0.20, -0.10, 0.0))
+    support._holding, support._prev_g = True, 10.0
+    support._update_hold({'gripper': 100.0})
+    support_release = panel_pos(support, support.data.mocap_pos[sid])
+    assert support.last_placement['target_policy'] == 'SUPPORT_TARGET'
+    assert support.last_placement['inside_safe_region']
+    assert close(support_release[2], support.floor + 0.06 + 0.02)
+
+    open_bin = sim_core.SimMirror(
+        piece='cube', scene_path=CONTRACT_SCENE,
+        target_id='black_open_bin_85mm')
+    open_bin.set_target((0.20, -0.10))
+    oid = open_bin.mocap_id[open_bin.PIECE]
+    open_bin.data.mocap_pos[oid] = open_bin.panel_to_sim((0.20, -0.10, 0.0))
+    open_bin._holding, open_bin._prev_g = True, 10.0
+    open_bin._update_hold({'gripper': 100.0})
+    bin_release = panel_pos(open_bin, open_bin.data.mocap_pos[oid])
+    assert open_bin.last_placement['target_policy'] == 'OPEN_BIN'
+    assert open_bin.last_placement['inside_safe_region']
+    assert close(bin_release[2], open_bin.floor + 0.02)
+
+    bin_inside = open_bin.validate_swept_clearance([{
+        'xyz_m': [0.20, -0.10, open_bin.floor + 0.021],
+        'radius_m': 0.019}])
+    bin_wall = open_bin.validate_swept_clearance([{
+        'xyz_m': [0.20 + 0.046, -0.10, open_bin.floor + 0.03],
+        'radius_m': 0.003}])
+    assert not bin_inside['collision'], bin_inside
+    assert bin_wall['collision'] and 'target_wall' in bin_wall['obstacle'], bin_wall
+
+    support_solid = support.validate_swept_clearance([{
+        'xyz_m': [0.20, -0.10, support.floor + 0.03],
+        'radius_m': 0.003}])
+    assert support_solid['collision'] \
+        and support_solid['obstacle'] == 'target', support_solid
+
+    oversized = dataclasses.replace(
+        open_bin.object_geometry, dimensions_m=(0.09, 0.09, 0.04))
+    oversized_result = sim_core.placement_contract(
+        open_bin.profile, open_bin.target_geometry, oversized,
+        open_bin.target_xy, open_bin.target_xy)
+    assert not oversized_result['inside_safe_region']
+    assert oversized_result['reason'] == 'piece_larger_than_region'
+
+    for invalid_sample in (
+            {'xyz_m': [math.nan, 0.0, 0.0], 'radius_m': 0.0},
+            {'xyz_m': [0.0, 0.0, 0.0], 'radius_m': -0.001}):
+        try:
+            support.validate_swept_clearance([invalid_sample])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'유효하지 않은 clearance 표본 수용: {invalid_sample}')
+
+    clear = support.validate_swept_clearance([
+        {'xyz_m': [0.50, 0.50, support.floor + 0.10], 'radius_m': 0.01}])
+    collision = support.validate_swept_clearance([
+        {'xyz_m': [0.0, 0.0, support.floor + 0.08], 'radius_m': 0.01}])
+    assert not clear['collision'] and clear['clearance_m'] > 0.0, clear
+    assert collision['collision'] and collision['obstacle'] == 'platform', collision
+    print('  support solid · open bin 빈 내부/벽 · oversized/NaN fail-closed: OK')
+
+    print('\n통과 — 차량 장착 MuJoCo 미러 11항목')
 
 
 if __name__ == '__main__':

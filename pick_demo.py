@@ -14,9 +14,11 @@ pick_red.py(손목캠 폐루프)와 달리 **hand-eye 정합**을 쓰는 첫 소
 import argparse
 import json
 import math
+import os
 import pathlib
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -24,15 +26,15 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
 
-BASE = 'http://127.0.0.1:8765'
+BASE = os.environ.get('SO101_PANEL_API', 'http://127.0.0.1:8765').rstrip('/')
 J = arm_lib.JOINTS
 POSE = {                    # (블롭 중심 높이, 파지 TCP 높이) — floor 기준 [m]
     'standing': (0.035, 0.045),
     'lying':    (0.011, 0.008),   # 죠 끝이 몸통 중심선(11mm) **아래**로 내려가야
                                   # 물체가 입 안에 들어온다 — 16mm 는 바깥턱에
                                   # 닿았다(실물 1차 실패). 최종 하강은 15% 저속
-    'cube':     (0.020, 0.010),   # 4×4cm 큐브(2026-08-20 전환): 중심 2cm,
-                                  # 죠 끝 floor+10mm — 패드가 몸통 중하부를 문다
+    'cube':     (0.020, 0.030),   # 4×4cm 큐브: 2026-08-31 실기에서 아랫턱이 큐브
+                                  # 윗면을 누른 뒤 집게 끝 하한을 floor+30mm로 상향
 }
 GRIP_OPEN = {'standing': 45, 'lying': 45,
              'cube': 45}     # 실측(2026-08-21): 4cm 큐브는 19.6 에서 물린다.
@@ -42,6 +44,7 @@ APPROACH_CAND = (0.02, 0.005, -0.01)   # 접근 고도 후보 — 원거리 x �
 LIFT_CAND = (0.03, 0.015, 0.0)         # 안 풀린다(리치). IK 되는 첫 값을 쓴다
 GRIP_OPEN_ABS = 55          # 절대 개방각 — delta 방식은 이미 열린 상태에서 이중
 GRIP_CLOSE_ABS = 7          # 개방(99, 아랫턱 젖힘)을 만들었다(실측). 절대각으로만.
+GRIP_EMPTY_MAX = 9.0        # 빈 집게는 목표 7° 부근. 큐브 실측 물림 11.1°와 분리
 # ★ 1 → 7 (2026-08-26 사용자 "너무 세게 잡는다"): 파지력은 P 제어라 **목표까지
 # 남은 각도에 비례**한다. 큐브를 물면 ~11 에서 멈추는데 목표가 1 이면 10° 만큼
 # 계속 밀고, 7 이면 4° 만큼만 민다 — 힘이 절반 이하. 물체를 놓칠 위험은 죠
@@ -77,8 +80,10 @@ def csv_log(**kw):
             if new:
                 w.writeheader()
             w.writerow(row)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f'CSV 기록 실패: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return False
+    return True
 
 
 def grip_close_ramp(target, steps=5, dt=0.19):   # 0.16→0.18→(5스텝·0.19: 추가 25% 감속, 2026-08-26)
@@ -87,38 +92,102 @@ def grip_close_ramp(target, steps=5, dt=0.19):   # 0.16→0.18→(5스텝·0.19:
     서보 상한 구조(22°/s 아니면 무제한, 중간 없음)라 궤적으로 감속한다."""
     import time as _t
     g = get('/state')['pos'].get('gripper', 50)
-    post('goto', joint='gripper', value=round(g, 1))       # 보호 해제
+    post_wait('goto', joint='gripper', value=round(g, 1))  # 보호 해제
     _t.sleep(0.15)
-    try:                                # 파지 힘 상한 낮추기 (살살 잡기)
-        post('grip_force', pct=45)
-    except Exception:
-        pass
+    post_wait('grip_force', pct=45)      # 파지 힘 상한 낮추기 (살살 잡기)
     for k in range(1, steps + 1):
-        post('goto', joint='gripper',
-             value=round(g + (target - g) * k / steps, 1))
+        post_wait('goto', joint='gripper',
+                  value=round(g + (target - g) * k / steps, 1))
         _t.sleep(dt)
 # 죠 닫힘축 실측(2026-08-20, MuJoCo 두 손끝 사이트 — 실물 대조된 롤 오프셋
 # 반영): 닫힘축 yaw = pan + CLOSE_AXIS + roll [°]. 롤 0 에서 닫힘축은 방사
 # 방향과 거의 직교(-94.3)라 방사로 누운 물체가 잡혔다. 방향 파지는 물체
 # 장축과 닫힘축이 직교하도록 roll 을 푼다 (축은 180° 대칭 → ±90 접기).
 CLOSE_AXIS = -94.3
+LAST_WORKER_COMMAND_ERROR = None
 
 
 def post(op, **kw):
     r = urllib.request.Request(f'{BASE}/cmd', method='POST',
                                data=json.dumps(dict(op=op, **kw)).encode(),
                                headers={'Content-Type': 'application/json'})
-    return json.load(urllib.request.urlopen(r, timeout=15))
+    try:
+        body = json.load(urllib.request.urlopen(r, timeout=15))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = {}
+        reason = body.get('msg') or body.get('error') or exc.reason
+        raise RuntimeError(f'{op} HTTP {exc.code}: {reason}') from exc
+    if not isinstance(body, dict):
+        raise RuntimeError(f'{op} 응답이 JSON object가 아닙니다')
+    if body.get('ok') is False or body.get('status') == 'rejected':
+        reason = body.get('reason') or body.get('msg') or body.get('error')
+        raise RuntimeError(f'{op} 거부: {reason or "사유 없음"}')
+    return body
+
+
+def post_wait(op, *, wait_timeout=10.0, **kw):
+    """Worker가 같은 command_id를 completed로 끝낸 명령만 반환한다.
+
+    ``POST /cmd``의 accepted는 큐 접수일 뿐 실제 서보 쓰기가 아니다.
+    닫힘 램프 중 STOP/lease 만료가 발생하면 중간 각도를
+    파지 접촉으로 오판하지 않고 즉시 실패로 올린다.
+    """
+    expected = ('move_q' if op == 'ik' else
+                'stop' if op == 'worker_hard_hold' else op)
+    return arm_lib.worker_submit_wait(
+        op, api=BASE, wait_timeout=wait_timeout, request_timeout=3.0,
+        expected_worker_op=expected, **kw)
+
+
+def require_gripper_motion_state(st):
+    """말단 집게 장치 정착값을 파지 근거로 쓸 수 있는 상태인지 확인한다."""
+    if st.get('connected') is not True:
+        raise arm_lib.WorkerCommandError('말단 집게 장치 대기 중 패널 연결이 끊겼습니다')
+    if st.get('calibrated') is not True:
+        raise arm_lib.WorkerCommandError('말단 집게 장치 대기 중 캘리브레이션 자격을 잃었습니다')
+    if st.get('torque') is not True or st.get('torque_state') != 'on':
+        raise arm_lib.WorkerCommandError('말단 집게 장치 대기 중 토크 ON 확인을 잃었습니다')
+    if st.get('safety_ready') is not True:
+        raise arm_lib.WorkerCommandError(
+            f'말단 집게 장치 안전 자격 상실: {st.get("safety_reason") or "사유 없음"}')
+    if st.get('stop_latched') is not False:
+        raise arm_lib.WorkerCommandError('말단 집게 장치 대기 중 정지 latch가 활성됐습니다')
+    if st.get('base_interlock_active') is not True:
+        raise arm_lib.WorkerCommandError(
+            f'베이스/팔 안전 임대 상실: '
+            f'{st.get("base_interlock_reason") or "사유 없음"}')
+    return st
 
 
 def get(path):
     return json.loads(urllib.request.urlopen(f'{BASE}{path}', timeout=15).read())
 
 
-def bail(msg):
-    post('stop')            # ARM 목표만 현재로 — 그리퍼 예압 유지
-    print(f'중단: {msg} — 정지(토크 유지)')
-    sys.exit(1)
+def remember_worker_error(error):
+    """하위 미션 step_result가 명령 ID와 terminal 상태를 보존하게 한다."""
+    global LAST_WORKER_COMMAND_ERROR
+    LAST_WORKER_COMMAND_ERROR = (
+        error.as_dict() if isinstance(error, arm_lib.WorkerCommandError)
+        else None)
+    return LAST_WORKER_COMMAND_ERROR
+
+
+def bail(msg, *, worker_error=None):
+    if worker_error is not None:
+        remember_worker_error(worker_error)
+    # 이 함수는 IK/Worker/검증 hard fault 전용이다. 미션 중 /stop은 process
+    # group SIGINT까지 보내 step_result/finally 기록을 끊으므로 Worker만 operator
+    # latch하는 별도 경계를 쓴다. 시각 유실·헛파지의 mission_recoverable hold는
+    # pick_wrist의 RecoverableMissionExit 경로만 요청한다.
+    if os.environ.get('SO101_MISSION_RUN_ID'):
+        post_wait('worker_hard_hold', wait_timeout=10.0,
+                  reason=str(msg)[:160])
+    else:
+        post_wait('stop', wait_timeout=10.0)
+    sys.exit(f'중단: {msg} — 정지(토크 유지)')
 
 
 def ensure_cam_home(timeout=90.0):
@@ -222,10 +291,18 @@ def wait_gripper_settle(timeout=35.0, target=None):
     성공이고, 정지 판정은 3연속(≈4.8초) + 최소 5초 경과를 요구한다 —
     닫힘이 물체에 걸려 멈추는 경우(목표 미달 정착)는 여전히 정지 쪽이 잡는다."""
     prev, still = None, 0
+    timeout = float(timeout)
     t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        time.sleep(1.2)
-        g = get('/state')['pos'].get('gripper')
+    deadline = t0 + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.2, remaining))
+        if time.monotonic() >= deadline:
+            break
+        st = require_gripper_motion_state(get('/state'))
+        g = st['pos'].get('gripper')
         if g is None:
             continue                       # 간헐 판독 누락 — 판정에 안 쓴다
         if target is not None and abs(g - target) < 6.0:
@@ -239,7 +316,28 @@ def wait_gripper_settle(timeout=35.0, target=None):
         else:
             still = 0
         prev = g
-    return prev
+    last = '판독 없음' if prev is None else f'마지막 {float(prev):.1f}°'
+    neutralized = False
+    neutralize_detail = ''
+    if prev is not None:
+        try:
+            post_wait('goto', joint='gripper', value=round(float(prev), 1))
+            neutralized = True
+            neutralize_detail = '마지막 실측 각도 hold 완료'
+        except Exception as hold_exc:
+            neutralize_detail = f'hold 실패({type(hold_exc).__name__})'
+    if not neutralized:
+        try:
+            post_wait('stop', wait_timeout=10.0)
+            neutralized = True
+            neutralize_detail += (' → ' if neutralize_detail else '') + 'STOP 완료'
+        except Exception as stop_exc:
+            neutralize_detail += (' → ' if neutralize_detail else '') + (
+                f'STOP 실패({type(stop_exc).__name__}: {stop_exc})')
+    raise arm_lib.WorkerCommandError(
+        f'말단 집게 장치가 {timeout:.1f}초 안에 정착하지 않았습니다 '
+        f'({last}) — 이 각도를 파지로 인정하지 않습니다. '
+        f'중화: {neutralize_detail}')
 
 
 def read_pix(tries=6, need=3):
@@ -311,41 +409,18 @@ def cube_face_yaw(R, t, floor, pix_frames, band=None):
 
 
 def move_and_wait(x, y, z, timeout=25.0, roll=None):
-    pre = get('/state').get('log', [])
-    pre_tail = pre[-1] if pre else ''            # 이 이동 전의 마지막 로그
     kw = dict(x=round(x, 4), y=round(y, 4), z=round(z, 4), pitch=-90)
     if roll is not None:                         # 방향 파지 — 하강 중 롤 유지
         kw['roll'] = round(roll, 1)
-    r = post('ik', **kw)
-    if not r.get('ok'):
-        bail(f'IK 실패 ({x:.3f},{y:.3f},{z:.3f}): {r.get("msg")}')
-    mapping = arm_lib.load_mapping()
-    want = {k.replace('.pos', ''): v
-            for k, v in arm_lib.rad_to_servo(r['q'], mapping).items()}
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        st = get('/state')
-        tail = st.get('log', [])[-1] if st.get('log') else ''
-        if '⛔' in tail:
-            bail(f'서버 거부/안전장치: {tail}')       # 게이트 거부는 토크 유지라 여기서 잡는다 (m47)
-        if not (st.get('torque') and st.get('connected')):
-            print(f'중단: 서버 안전장치 발동/통신 이상 — {tail}')
-            sys.exit(1)
-        gap = max(abs((st['pos'][j] - want[j] + 180) % 360 - 180) for j in J)
-        if gap < 2.5:   # 실측: shoulder_lift 중력 정착 오차 1.2° — 0.8은 도달 불가.
-                        # 2026-08-25 P게인 정지 오차 1.8~1.9° 실측(팔꿈치·접힘)로
-                        # 1.5→2.5 확대. 잔차는 다음 IBVS 스텝이 시각으로 보정.
-                        # 파지 여유는 h_grip +4mm(m50)로 확보
-            return
-        # 서버 완료 신호 (14차 리뷰 M5, 2026-08-20 실측 2회): 서버 도달 기준은
-        # 3.0° 라 1.5~3.0° 정착은 gap 만으론 영영 미도달 → 타임아웃(리치 경계
-        # 상승에서 재현). 이 이동이 만든 **새** '이동 완료' 로그 + gap<3.5° 면
-        # 도달로 본다. 직전 이동과 로그 문자열이 우연히 같으면(전류피크 동일)
-        # 신호를 놓치지만, 그때는 기존 타임아웃 경로로 떨어질 뿐이다(fail-safe).
-        if '이동 완료' in tail and tail != pre_tail and gap < 3.5:
-            return
-        time.sleep(0.3)
-    bail(f'도달 시간 초과 ({x:.3f},{y:.3f},{z:.3f})')
+    try:
+        arm_lib.worker_submit_wait(
+            'ik', api=BASE, wait_timeout=float(timeout), request_timeout=3.0,
+            expected_worker_op='move_q', require_applied=True, **kw)
+    except arm_lib.WorkerCommandError as exc:
+        bail(f'IK 이동 실패 ({x:.3f},{y:.3f},{z:.3f}): {exc}',
+             worker_error=exc)
+    except RuntimeError as exc:
+        bail(f'IK 이동 실패 ({x:.3f},{y:.3f},{z:.3f}): {exc}')
 
 
 def main():
@@ -354,7 +429,9 @@ def main():
     ap.add_argument('--legacy-bench', action='store_true',
                     help='Astra/hand-eye 레거시 벤치 경로를 명시적으로 허용')
     ap.add_argument('--dry', action='store_true', help='위치 계산·검증만, 이동 없음')
+    arm_lib.add_execute_argument(ap)
     a = ap.parse_args()
+    arm_lib.apply_execute_flag(a)
     if not a.legacy_bench:
         sys.exit('pick_demo.py는 레거시 뎁스 벤치 전용입니다 — 차량에서는 '
                  'pick_wrist.py를 사용하세요. 벤치에서만 --legacy-bench를 지정합니다')
@@ -522,13 +599,12 @@ def main():
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 후 실행하세요 (팔이 접혀 있으면 unfold_safe 먼저)')
 
-    post('speed', pct=100)  # 자유공간 이동 최고속 (사용자: 추가 1.5배)
+    post_wait('speed', pct=100)  # 다음 IK 시간 계산 전에 실제 속도 적용 완료
     print('① 접근 자세로 이동')
     move_and_wait(x, y, APPROACH_Z, roll=roll)
     print('② 그리퍼 개방')
-    g_now = get('/state')['pos'].get('gripper', 50)
-    post('goto', joint='gripper', value=round(g_now, 1))  # 위치 재전송 = 과부하 보호 해제
-    time.sleep(1.0)
+    # grip_close_ramp의 첫 tracked goto가 현재 위치를 재전송해
+    # 과부하 보호를 풀고 terminal 완료까지 확인한다.
     grip_close_ramp(GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS), steps=4, dt=0.14)
     wait_gripper_settle()
     # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신.
@@ -552,7 +628,7 @@ def main():
         roll = roll_for_cube(yaw_face, x, y)
     print('③ 하강 (2단 — 최종은 15% 저속)')
     move_and_wait(x, y, (APPROACH_Z + z_grip) / 2, roll=roll)
-    post('speed', pct=45)   # 최종 하강 — 접촉 정밀 구간이라 감속
+    post_wait('speed', pct=45)   # 최종 하강 — 접촉 정밀 구간이라 감속
     move_and_wait(x, y, z_grip, timeout=35.0, roll=roll)
     print('④ 파지')
     grip_close_ramp(GRIP_CLOSE_ABS)
@@ -565,9 +641,13 @@ def main():
     # ★ 압력 해제 — 목표를 현재값으로 되쓴다. 목표 0 을 남기면 접촉 후에도
     # 계속 쥐어짜 수 분 뒤 펌웨어 과부하 보호(25%)가 떠서 열기가 거부된다
     # (실측 2026-08-20: RxPacketError Overload). 위치 유지 토크만으로 충분.
-    post('goto', joint='gripper', value=round(g, 1))
-    post('speed', pct=100)
-    print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
+    post_wait('goto', joint='gripper', value=round(g, 1))
+    if g <= GRIP_EMPTY_MAX:
+        bail(f'말단 집게 장치가 {g:.1f}°까지 닫혀 큐브 물림 '
+             f'최소 {GRIP_EMPTY_MAX:.1f}°를 넘지 못함')
+    post_wait('speed', pct=100)
+    print(f'   말단 집게 장치 {g:.1f}°에서 닫힘 완료 '
+          f'(빈 집게 상한 {GRIP_EMPTY_MAX:.1f}°)')
     print('⑤ 들어올리기')
     move_and_wait(x, y, LIFT_Z, roll=roll)
     # 검증: 팔과 함께 블롭이 움직이는가 (pan 흔들기)
@@ -579,11 +659,14 @@ def main():
     time.sleep(4)
     if b0 is not None and b1 is not None:
         moved = float(np.linalg.norm(np.array(b1) - np.array(b0))) * 0.6
-        verdict = '물었음 (블롭이 팔을 따라옴)' if moved > 0.015 else \
-                  '놓친 듯 (블롭이 제자리)'
-        print(f'⑥ 판정: {verdict} — 시선 이동 {1000*moved:.0f}mm 상당, 그리퍼 {g:.1f}')
+        if moved <= 0.015:
+            bail(f'파지 확인 실패 — 블롭이 말단 집게 장치를 '
+                 f'따라오지 않음(시선 이동 {1000*moved:.0f}mm 상당)')
+        print(f'⑥ 판정: 물었음(블롭이 말단 집게 장치를 따라옴) '
+              f'— 시선 이동 {1000*moved:.0f}mm 상당, '
+              f'말단 집게 장치 {g:.1f}°')
     else:
-        print('⑥ 판정 불가(관측 부족) — 눈으로 확인해 주세요')
+        bail('파지 판정 불가 — 들어올린 뒤 시각 관측이 부족함')
     print('완료 — 팔은 물체를 든 채 대기 (토크 ON). 내려놓기/파킹은 별도 지시로.')
 
 

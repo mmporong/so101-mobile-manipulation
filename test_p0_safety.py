@@ -156,8 +156,10 @@ class ThermalBus(Bus):
         super().__init__(torque={m: 1 for m in ALL})
         self.temperature = temperature
         self.fail_gripper = fail_gripper
+        self.reads = []
 
     def read(self, name, motor, normalize=False):
+        self.reads.append((name, motor))
         if name == 'Present_Temperature':
             return self.temperature
         if name == 'Present_Current':
@@ -262,6 +264,10 @@ class UncloseableEnergizedBus(SilentFailedGripperBus):
 
 
 def worker(bus=None, port='/dev/fake'):
+    from test_collision_geometry import FixtureGeometry
+    arm_gui.arm_lib.load_collision_geometry_capability = (
+        lambda **kwargs: FixtureGeometry(
+            kwargs.get('profile') or arm_gui.arm_lib.selected_surface_profile()))
     w = Worker(port, 'follower', base_interlock_provider=lambda: {
         'active': True, 'reason': 'stationary', 'expires_at': 1e12})
     # P0 단위 테스트는 저장소 밖 ROS workspace의 FK에 기대지 않는다. 실제 경로의
@@ -297,6 +303,38 @@ def test_numeric_rejection():
             pass
         else:
             raise AssertionError(f'public duration이 {bad!r} 허용')
+
+
+def test_connect_recovery_is_allowed_only_while_disconnected_under_latch():
+    disconnected = worker()
+    disconnected._stop_latched.set()
+    disconnected.state.update(stop_latched=True, connected=False)
+    command_id = disconnected.submit('connect')
+    queued = disconnected.cmd.get_nowait()
+    assert queued['id'] == command_id and queued['op'] == 'connect'
+    assert disconnected.command_status(command_id)['status'] == 'accepted'
+
+    connected = worker()
+    connected._stop_latched.set()
+    connected.state.update(stop_latched=True, connected=True)
+    command_id = connected.submit('connect')
+    status = connected.command_status(command_id)
+    assert status['status'] == 'rejected'
+    assert '정지 latch' in status['reason']
+
+
+def test_stop_cause_and_connection_generation_are_public():
+    w = worker()
+    assert w.snapshot()['connection_generation'] == 0
+    w.stop_and_cancel('운영자 정지')
+    state = w.snapshot()
+    assert state['stop_source'] == 'operator'
+    assert state['stop_reason'] == '운영자 정지'
+
+    w._latch_transport_fault('시리얼 응답 없음')
+    state = w.snapshot()
+    assert state['stop_source'] == 'transport'
+    assert '시리얼' in state['stop_reason']
 
 
 def test_torque_authority_helpers():
@@ -552,6 +590,36 @@ def test_energized_reconnect_reproves_new_bus_in_new_epoch():
     assert [set(values) for _name, values, _raw in new_bus.writes] == [
         set(ARM), {'gripper'}]
     assert new_bus.goal['gripper'] == 123
+
+
+def test_energized_reconnect_readonly_revalidates_bounded_profile():
+    bus = EEPROMBus({m: 1 for m in ALL})
+    w = worker(bus)
+    calib = {m: types.SimpleNamespace(
+        homing_offset=0, range_min=0, range_max=4095) for m in ALL}
+    for motor in ALL:
+        bus.reg[('Homing_Offset', motor)] = 0
+        bus.reg[('Min_Position_Limit', motor)] = 0
+        bus.reg[('Max_Position_Limit', motor)] = 4095
+        bus.reg[('Maximum_Velocity_Limit', motor)] = 254
+        table = (arm_gui.PROTECT_GRIPPER if motor == 'gripper'
+                 else arm_gui.PROTECT)
+        for register, value in table.items():
+            bus.reg[(register, motor)] = value
+        bus.reg[('Goal_Velocity', motor)] = 20
+        bus.reg[('Acceleration', motor)] = 10
+        if motor in ARM:
+            bus.reg[('Torque_Limit', motor)] = 300
+
+    w._verify_energized_safety_readonly(calib, 'on')
+    assert bus.eeprom_writes == [] and bus.disabled == 0
+    bus.reg[('Goal_Velocity', 'elbow_flex')] = 0
+    try:
+        w._verify_energized_safety_readonly(calib, 'on')
+    except RuntimeError as exc:
+        assert 'Goal_Velocity' in str(exc)
+    else:
+        raise AssertionError('무제한 Goal_Velocity 통전 재연결이 허용됨')
 
 
 def test_malformed_marker_closes_bus_before_authority_release():
@@ -1125,53 +1193,16 @@ def test_final_maintenance_torque_failure_publishes_actual_state_without_cut():
             os.environ['SO101_MAINTENANCE_STATE_DIR'] = old_state_dir
 
 
-def test_thermal_values_fail_closed():
-    for value in (91.0, float('nan'), float('inf'), True):
-        w = worker(ThermalBus(value))
-        w._temp_t = 0.0
-        w._guard(w.snapshot())
-        assert not w.snapshot()['safety_ready'], value
-
-    w = worker(ThermalBus(65.0, fail_gripper=True))
-    for _ in range(2):
-        w._temp_t = 0.0
-        w._guard(w.snapshot())
-    state = w.snapshot()
-    assert not state['safety_ready']
-    assert '격리 실패' in state['safety_reason']
-    assert state['torque'] is True and state['torque_state'] == 'on'
-
-
-def test_gripper_overheat_silent_hold_falls_back_to_exact_off():
-    w = worker(SilentGripperHoldBus(65.0))
-    w.bus.goal['gripper'] = 777
-    w.bus.pos['gripper'] = 123
-    for _ in range(2):
-        w._temp_t = 0.0
-        w._guard(w.snapshot())
-    state = w.snapshot()
-    assert state['stop_latched'] is True
-    assert w.bus.goal['gripper'] == 777, 'silent hold가 적용된 것으로 오인됨'
-    assert w.bus.torque['gripper'] == 0
-    assert state['torque_state'] == 'mixed'
-    assert any('gripper만 OFF 확인' in line for line in state['log'])
-
-
-def test_hot_gripper_mitigation_runs_when_camera_stop_fails():
+def test_temperature_register_is_never_read():
     w = worker(ThermalBus(65.0))
-    w.bus.goal['gripper'] = 777
-    w.bus.pos['gripper'] = 123
-    w._stop_camera_axes = lambda: False
-    for _ in range(2):
-        w._temp_t = 0.0
-        w._guard(w.snapshot())
+    w._guard_telemetry_t = 0.0
+    w._guard(w.snapshot())
     state = w.snapshot()
-    assert state['stop_latched'] is True
-    assert state['safety_ready'] is False
-    assert w.bus.goal['gripper'] == 123, (
-        'camera 실패가 hot gripper 현재위치 hold를 단락함')
-    assert w._last_stop_evidence == {
-        'arm': True, 'gripper': True, 'camera': False}
+    names = [name for name, _motor in w.bus.reads]
+    assert 'Present_Temperature' not in names, names
+    assert 'Present_Current' in names and 'Present_Voltage' in names
+    assert state['temp'] == {} and state['temperature_monitoring'] is False
+    assert state['safety_ready'] is True and state['stop_latched'] is False
 
 
 def test_swept_floor_counterexample():
@@ -1209,12 +1240,14 @@ def test_swept_floor_counterexample():
 
 def test_guard_and_current_read_fail_closed():
     w = worker(Bus(telemetry_error=True))
-    w._temp_t = 0.0
+    w._guard_telemetry_t = 0.0
     w._guard(w.snapshot())
     assert not w.snapshot()['safety_ready']
     assert '감시' in w.snapshot()['safety_reason']
 
-    w = worker(Bus(current_error=True))
+    current_bus = Bus(current_error=True)
+    current_bus.pos['gripper'] = 25.0
+    w = worker(current_bus)
     old_sleep = arm_gui.time.sleep
     arm_gui.time.sleep = lambda _s: None
     try:
@@ -1224,6 +1257,123 @@ def test_guard_and_current_read_fail_closed():
         arm_gui.time.sleep = old_sleep
     assert not w.snapshot()['safety_ready']
     assert '전류' in w.snapshot()['safety_reason']
+
+
+def test_stop_test_current_read_failure_is_not_zero_current():
+    class StopTestCurrentFailBus(Bus):
+        def read(self, name, motor, normalize=False):
+            if name == 'Present_Current':
+                raise OSError('stop-test current offline')
+            return super().read(name, motor, normalize)
+
+    w = worker(StopTestCurrentFailBus(torque={m: 1 for m in ALL}))
+    assert w._do_stop_test('gripper', 10.0, 0.2) is None
+    state = w.snapshot()
+    assert not state['safety_ready']
+    assert any('stop_test 전류 읽기 실패' in line for line in state['log'])
+
+
+def test_camera_home_parse_error_is_visible():
+    w = worker()
+    old_path = arm_gui.CAM_CALIB
+    with tempfile.TemporaryDirectory() as directory:
+        arm_gui.CAM_CALIB = pathlib.Path(directory) / 'cam_calib.json'
+        arm_gui.CAM_CALIB.write_text('{broken')
+        w._camera_axes_enabled = lambda: True
+        w._cam_read = lambda _register, _sid: 0
+        try:
+            snapshot = w.cam_snapshot()
+        finally:
+            arm_gui.CAM_CALIB = old_path
+    assert snapshot['home'] is None
+    assert 'JSONDecodeError' in snapshot['home_error']
+
+
+def test_guard_retries_one_transient_current_read():
+    bus = Bus(torque={m: 1 for m in ALL})
+    original_read = bus.read
+    failures = {'wrist_roll': 0}
+
+    def transient_read(name, motor, normalize=False):
+        if (name == 'Present_Current' and motor == 'wrist_roll'
+                and failures['wrist_roll'] == 0):
+            failures['wrist_roll'] += 1
+            raise OSError('one transient wrist packet miss')
+        if name == 'Present_Voltage':
+            return 122
+        return original_read(name, motor, normalize)
+
+    bus.read = transient_read
+    w = worker(bus)
+    w._guard_telemetry_t = 0.0
+    w._guard(w.snapshot())
+
+    state = w.snapshot()
+    assert failures['wrist_roll'] == 1
+    assert state['safety_ready'] and not state['stop_latched']
+    assert state['torque_state'] == 'on'
+    assert state['current']['wrist_roll'] == 0
+    assert state['volt'] == {'shoulder_pan': 12.2, 'wrist_roll': 12.2}
+    assert any('wrist_roll' in line and '재시도' in line for line in state['log'])
+
+
+def test_guard_does_not_poll_loaded_gripper_telemetry():
+    bus = Bus(torque={m: 1 for m in ALL})
+    original_read = bus.read
+    reads = []
+
+    def loaded_gripper_read(name, motor, normalize=False):
+        reads.append((name, motor))
+        if motor == 'gripper' and name in ('Present_Current', 'Present_Voltage'):
+            raise OSError('expected gripper overload while holding object')
+        if name == 'Present_Voltage':
+            return 122
+        return original_read(name, motor, normalize)
+
+    bus.read = loaded_gripper_read
+    w = worker(bus)
+    w._guard_telemetry_t = 0.0
+    w._guard(w.snapshot())
+    state = w.snapshot()
+    assert state['safety_ready'] and not state['stop_latched']
+    assert all(motor != 'gripper' for name, motor in reads
+               if name in ('Present_Current', 'Present_Voltage'))
+
+
+def test_interp_refreshes_observed_position_timestamp():
+    bus = Bus(torque={m: 1 for m in ALL})
+    bus.pos['gripper'] = 25.0
+    w = worker(bus)
+    w._base_status()
+    seen_at_reads = []
+    position_returned_at = [None]
+    original_read = w.bus.sync_read
+    old_sleep = arm_gui.time.sleep
+
+    def inspect_read(name, motors=None, normalize=True):
+        if name == 'Present_Current' and position_returned_at[0] is not None:
+            old_sleep(0.02)
+        result = original_read(name, motors, normalize)
+        if name == 'Present_Position' and motors == ARM:
+            seen_at_reads.append(w.snapshot()['pos_at'])
+            position_returned_at[0] = time.monotonic()
+        return result
+
+    w.bus.sync_read = inspect_read
+    before = w.snapshot()['pos_at']
+    arm_gui.time.sleep = lambda _seconds: None
+    try:
+        cur = {j: w.bus.pos[j] for j in ARM}
+        target = dict(cur)
+        target['elbow_flex'] += 1.0
+        assert w._interp(cur, target, 0.5) is True
+    finally:
+        arm_gui.time.sleep = old_sleep
+    assert len(seen_at_reads) >= 2
+    assert seen_at_reads[1] > seen_at_reads[0] >= before
+    observed_at = w.snapshot()['pos_at']
+    assert abs(observed_at - position_returned_at[0]) < 0.01
+    assert time.monotonic() - observed_at >= 0.015
 
 
 def test_worker_identity_mismatch_preserves_authority_and_never_falls_back():
@@ -1301,7 +1451,10 @@ def test_reconnect_closed_owned_preserves_a_on_mismatch_and_missing_port():
 
 
 def main():
-    tests = [test_numeric_rejection, test_torque_authority_helpers,
+    tests = [test_numeric_rejection,
+             test_connect_recovery_is_allowed_only_while_disconnected_under_latch,
+             test_stop_cause_and_connection_generation_are_public,
+             test_torque_authority_helpers,
              test_mixed_torque_stop_and_off_are_exact,
              test_silent_stop_hold_falls_back_to_exact_off,
              test_stop_rejects_when_hold_and_exact_off_both_fail,
@@ -1315,6 +1468,7 @@ def main():
              test_energized_connect_latches_before_hold_and_blocks_late_goals,
              test_unproven_energized_connect_closes_bus_and_stays_latched,
              test_energized_reconnect_reproves_new_bus_in_new_epoch,
+             test_energized_reconnect_readonly_revalidates_bounded_profile,
              test_malformed_marker_closes_bus_before_authority_release,
              test_unclosed_malformed_marker_retains_bus_and_authority,
              test_unclosed_failed_energized_normalization_retains_ownership,
@@ -1331,10 +1485,13 @@ def main():
              test_every_eeprom_transaction_stays_dirty_after_nth_failure,
              test_stale_maintenance_marker_requires_full_worker_recovery,
              test_final_maintenance_torque_failure_publishes_actual_state_without_cut,
-             test_thermal_values_fail_closed,
-             test_gripper_overheat_silent_hold_falls_back_to_exact_off,
-             test_hot_gripper_mitigation_runs_when_camera_stop_fails,
-             test_swept_floor_counterexample, test_guard_and_current_read_fail_closed]
+             test_temperature_register_is_never_read,
+             test_swept_floor_counterexample, test_guard_and_current_read_fail_closed,
+             test_stop_test_current_read_failure_is_not_zero_current,
+             test_camera_home_parse_error_is_visible,
+             test_guard_retries_one_transient_current_read,
+             test_guard_does_not_poll_loaded_gripper_telemetry,
+             test_interp_refreshes_observed_position_timestamp]
     tests.insert(-1, test_worker_identity_mismatch_preserves_authority_and_never_falls_back)
     tests.insert(-1, test_reconnect_closed_owned_preserves_a_on_mismatch_and_missing_port)
     for test in tests:

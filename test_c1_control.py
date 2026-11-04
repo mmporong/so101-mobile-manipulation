@@ -105,6 +105,9 @@ class FakeBus:
 
 
 def mkworker(bus):
+    from test_collision_geometry import FixtureGeometry
+    arm_lib.load_collision_geometry_capability = lambda **kwargs: FixtureGeometry(
+        kwargs.get('profile') or arm_lib.selected_surface_profile())
     w = Worker('/dev/null', 'follower', base_interlock_provider=lambda: {
         'active': True, 'reason': 'fake stationary base', 'expires_at': 999999999.0})
     w.bus = bus

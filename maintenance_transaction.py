@@ -179,6 +179,27 @@ def ensure_legacy_marker_safe(device, state_root=None, *, identity=None,
                         'stable maintenance marker physical identity 불일치 — '
                         '수동 복구가 필요합니다')
                 continue
+            marker_device = payload.get('device')
+            marker_resolved = (
+                str(pathlib.Path(marker_device).expanduser().resolve(strict=False))
+                if isinstance(marker_device, str) and marker_device else None)
+            current_nonserial = (
+                payload.get('version') == MARKER_VERSION
+                and payload.get('identity_kind') == 'nonserial-path'
+                and marker_resolved is not None
+                and not is_actual_serial_path(
+                    marker_device, resolved=marker_resolved)
+                and existing_identity == f'path:{marker_resolved}'
+                and payload.get('device_key') == hashlib.sha256(
+                    existing_identity.encode()).hexdigest()[:20])
+            if current_nonserial:
+                marker_key = payload['device_key']
+                canonical_names = {
+                    f'{marker_key}.json', f'{marker_key}.json.pending'}
+                if path.name not in canonical_names:
+                    unresolved.append(
+                        f'{path.name}: nonserial marker filename namespace 불일치')
+                continue
             # prefix는 provenance가 아니다. v3/무표식 marker는 명시 mapping
             # 없이는 physical marker로 간주하거나 건너뛰지 않는다.
             claimed_identity = next((provisioned[key] for key in (
@@ -190,8 +211,11 @@ def ensure_legacy_marker_safe(device, state_root=None, *, identity=None,
                     and path.name == expected_alias_name):
                 matching.append((path, payload))
             else:
-                unresolved.append(
-                    f'{path.name}: alias-key v3 identity 증거 없음')
+                kind = payload.get('identity_kind')
+                detail = ('nonserial marker 검증 실패'
+                          if kind == 'nonserial-path'
+                          else 'alias-key v3 identity 증거 없음')
+                unresolved.append(f'{path.name}: {detail}')
             continue
         if payload.get('version') != 2:
             unresolved.append(f'{path.name}: legacy version')

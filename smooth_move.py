@@ -18,6 +18,7 @@ import math
 import pathlib
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 HERE = pathlib.Path(__file__).parent
@@ -51,6 +52,36 @@ def _post(op, timeout=3.0, **kw):
 
 def _state(timeout=3.0):
     return json.loads(urllib.request.urlopen(f'{BASE}/state', timeout=timeout).read())
+
+
+def _wait_terminal(response, timeout=10.0):
+    """비동기 Worker 명령이 실제 완료될 때까지 기다린다.
+
+    테스트 대역처럼 command_id 없이 동기 완료를 돌려주는 호출자는 그대로
+    허용한다. 실제 패널은 command_id를 항상 주므로 accepted 응답만 보고 다음
+    안전 상태 전환으로 넘어가는 경쟁을 막는다.
+    """
+    if not isinstance(response, dict):
+        raise CommandRejected('명령 응답이 JSON object가 아닙니다')
+    if response.get('status') == 'completed':
+        return response
+    command_id = response.get('command_id')
+    if not command_id:
+        return response
+    deadline = time.monotonic() + float(timeout)
+    url = f'{BASE}/command?id={urllib.parse.quote(str(command_id), safe="")}'
+    while time.monotonic() < deadline:
+        status = json.loads(urllib.request.urlopen(url, timeout=3.0).read())
+        phase = status.get('status') if isinstance(status, dict) else None
+        if phase == 'completed':
+            return status
+        if phase == 'rejected':
+            reason = status.get('reason') or '사유 없음'
+            raise CommandRejected(f'{status.get("op", "명령")} 서버 거부: {reason}')
+        if phase not in ('accepted', 'executing'):
+            raise CommandRejected(f'명령 상태가 유효하지 않습니다: {phase!r}')
+        time.sleep(0.02)
+    raise RuntimeError(f'명령 완료 시간 초과: {command_id}')
 
 
 _K = None
@@ -165,7 +196,7 @@ def stream(ticks, hz=15.0, z_floor=None):
         gate_t = 0.0
         prev_pos = None
         # 전환 요청의 HTTP 응답과 Worker 적용 상태를 둘 다 확인한다.
-        _post('teleop_profile', on=True, timeout=10.0)
+        _wait_terminal(_post('teleop_profile', on=True, timeout=10.0), timeout=10.0)
         for _ in range(12):
             if required_state('무제한 프로파일 확인').get('teleop'):
                 break
@@ -214,8 +245,10 @@ def stream(ticks, hz=15.0, z_floor=None):
                             f'실측 z {fk_z(pos):+.3f} < 하한 {z_floor:+.3f}')
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
-        # 마무리에서는 명령을 다시 보내지 않는다. 마지막 틱의 목표를 향해 서보가
-        # 계속 움직이는 동안 도달 여부만 최대 20초 확인한다.
+        # 서버의 pose 경계는 각 명령을 실측 현재각에서 최대 4° 앞까지만 허용한다.
+        # 스트리밍 끝에 관절이 궤적을 뒤따르는 중이면 마지막 목표도 4° 앞에서
+        # 잘려 그대로 멈춘다. 최종 목표를 0.5초마다 다시 제출해 제한 범위 안에서
+        # 부드럽게 따라잡되, 움직임이 없으면 기존 정체 판정으로 중단한다.
         tgt = ticks[-1]
         last = None
         for k in range(40):                        # 최대 20초
@@ -237,6 +270,10 @@ def stream(ticks, hz=15.0, z_floor=None):
                 if last is not None and abs(gap - last) < 0.05 and k > 12:
                     raise RuntimeError(f'수렴 정체 — 목표에서 {gap:.1f}° 남음')
                 last = gap
+                _wait_terminal(
+                    _post('pose', joints={j: round(tgt[j], 2) for j in J5},
+                          timeout=3.0),
+                    timeout=3.0)
             time.sleep(0.5)
         raise RuntimeError(f'수렴 시간 초과 — 목표에서 {gap:.1f}° 남음')
 
@@ -250,7 +287,7 @@ def stream(ticks, hz=15.0, z_floor=None):
     cleanup_error = None
     try:
         # 성공·실패·Ctrl-C 모두 여기서 안전 프로파일 복원을 확인한다.
-        _post('teleop_profile', on=False, timeout=10.0)
+        _wait_terminal(_post('teleop_profile', on=False, timeout=10.0), timeout=10.0)
         for _ in range(10):
             if not _state().get('teleop'):
                 break

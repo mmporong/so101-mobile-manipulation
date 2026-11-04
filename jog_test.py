@@ -54,7 +54,9 @@ def main():
                     help='실행 중인 패널 Worker API')
     ap.add_argument('--port', help=argparse.SUPPRESS)
     ap.add_argument('--id', help=argparse.SUPPRESS)
+    arm_lib.add_execute_argument(ap)
     a = ap.parse_args()
+    arm_lib.apply_execute_flag(a)
     if not a.joint and not a.all:
         ap.error('관절 이름을 주거나 --all')
     if a.port is not None or a.id is not None:

@@ -25,19 +25,23 @@ def interlock(clock, *, freshness=0.5, lease=0.75):
         stationary_hold_s=1.0, odom_freshness_s=freshness,
         cmd_vel_freshness_s=freshness, graph_freshness_s=freshness,
         lease_s=lease, cmd_vel_owner='collision_monitor',
+        cmd_vel_input_owner='so101_mobile_mission',
         driver_subscriber='jdamr_base_driver', clock=clock)
 
 
 def observe(lock, clock, odom_linear=0.0, odom_angular=0.0,
             cmd_linear=0.0, cmd_angular=0.0,
             publishers=(('collision_monitor', '/'),),
-            subscribers=(('jdamr_base_driver', '/'),)):
+            subscribers=(('jdamr_base_driver', '/'),),
+            input_publishers=(), input_ready=True):
     return lock.observe(odom_linear_mps=odom_linear,
                         odom_angular_rps=odom_angular,
                         cmd_vel_linear_mps=cmd_linear,
                         cmd_vel_angular_rps=cmd_angular,
                         cmd_vel_publishers=publishers,
                         cmd_vel_subscribers=subscribers,
+                        cmd_vel_input_publishers=input_publishers,
+                        cmd_vel_input_ready=input_ready,
                         observed_at=clock())
 
 
@@ -49,6 +53,7 @@ class StopBus:
         self.writes = []
         self.disabled = 0
         self.torque_enabled = {m: 1 for m in ALL}
+        self.torque_read_failure = False
         self.telemetry_reads = []
 
     def sync_read(self, name, motors=None, normalize=True):
@@ -70,6 +75,8 @@ class StopBus:
 
     def read(self, name, motor, normalize=False):
         if name == 'Torque_Enable':
+            if self.torque_read_failure:
+                raise OSError('torque read failed')
             return self.torque_enabled[motor]
         if name in ('Present_Temperature', 'Present_Current', 'Present_Voltage'):
             self.telemetry_reads.append((name, motor))
@@ -112,6 +119,34 @@ def main():
 
     clock = Clock(); lock = interlock(clock)
     assert not observe(lock, clock, cmd_linear=0.02)['active'], 'cmd_vel spike revoke 안 함'
+
+    # Collision Monitor는 stop_pub_timeout 뒤 0속도 출력을 멈춘다. 입력 publisher가
+    # 아예 없고 odom·최종 소유권이 정상인 부팅 대기는 명시적인 정지 상태다.
+    clock = Clock(); lock = interlock(clock)
+    for dt in (0.0, 0.4, 0.4, 0.25):
+        clock.advance(dt)
+        no_input = observe(lock, clock, input_publishers=())
+    assert no_input['active'] and no_input['cmd_vel_input_mode'] == 'no_input_owner'
+
+    # 미션 입력 owner가 나타난 뒤에는 fresh 요청속도가 오기 전까지 닫고, 0속도는
+    # 열며 비영점 요청과 다른 owner는 즉시 닫는다.
+    pending = observe(
+        lock, clock,
+        input_publishers=(('so101_mobile_mission', '/'),), input_ready=False)
+    assert not pending['active'] and '입력 명령 증거' in pending['reason']
+    for dt in (0.0, 0.4, 0.4, 0.25):
+        clock.advance(dt)
+        mission_zero = observe(
+            lock, clock,
+            input_publishers=(('so101_mobile_mission', '/'),))
+    assert mission_zero['active'] and mission_zero['cmd_vel_input_mode'] == 'mission_input'
+    moving_request = observe(
+        lock, clock, cmd_linear=0.02,
+        input_publishers=(('so101_mobile_mission', '/'),))
+    assert not moving_request['active'] and '/cmd_vel 이동 명령' in moving_request['reason']
+    wrong_owner = observe(
+        lock, clock, input_publishers=(('web_teleop', '/'),))
+    assert not wrong_owner['active'] and '입력 소유권' in wrong_owner['reason']
 
     clock = Clock(); lock = interlock(clock)
     assert not observe(lock, clock, publishers=('nav2',))['active']
@@ -175,10 +210,17 @@ def main():
         cmd_vel_publishers=[('collision_monitor', '/')],
         cmd_vel_subscribers=[('jdamr_base_driver', '/')], observed_at=clock())
     assert gated._write_motion({'gripper': 30.0}, check_floor=False) is None
+    arm_target = {motor: gated.bus.raw[motor] for motor in ARM}
+    gated.state['last_command'] = {
+        'id': 'cmd-settled-arm', 'op': 'move_q', 'status': 'completed',
+        'applied_action': arm_target,
+    }
     before = len(gated.bus.writes)
     gated._poll()
     after = len(gated.bus.writes)
-    assert_stop_hold_writes(gated.bus.writes[before:after])
+    assert after == before, '완료 자세 유지 중인 정상 베이스 이동이 TTL hold를 반복함'
+    assert gated._base_stop_latched is True
+    assert any('팔 완료 자세 유지' in line for line in gated.snapshot()['log'])
     gated._poll()
     assert len(gated.bus.writes) == after, '인터록 상실 정지가 poll마다 반복됨'
 
@@ -231,21 +273,54 @@ def main():
     assert moving._base_stop_latched is True
     assert_stop_hold_writes(moving.bus.writes[-2:], moving.bus.raw)
 
-    # 일부 통전·read-back unknown도 off로 간주하지 않고 정지·telemetry 감시한다.
-    for torque_state in ('mixed', 'unknown'):
+    # 캐시가 exact ON이어도 fresh read-back mixed/unknown/실패면 hold를 생략하지 않는다.
+    for torque_case in ('mixed', 'unknown', 'read_failure'):
         uncertain = Worker('/dev/fake', 'follower', base_interlock_provider=lambda: {
             'active': False, 'reason': 'fake base lost', 'expires_at': 0.0})
         uncertain.bus = StopBus()
-        uncertain.bus.torque_enabled['gripper'] = 0
-        uncertain.state.update(connected=True, calibrated=True, torque=None,
-                               torque_state=torque_state, safety_ready=True,
+        if torque_case == 'mixed':
+            uncertain.bus.torque_enabled['gripper'] = 0
+        elif torque_case == 'unknown':
+            uncertain.bus.torque_enabled['gripper'] = 2
+        else:
+            uncertain.bus.torque_read_failure = True
+        uncertain.state.update(connected=True, calibrated=True, torque=True,
+                               torque_state='on', safety_ready=True,
                                pan_lock=-15.6, pan_tol=7.0,
                                pos=dict(uncertain.bus.raw), pos_at=clock())
-        uncertain._temp_t = 0.0
+        uncertain.state['last_command'] = {
+            'id': 'cmd-cached-on', 'op': 'move_q', 'status': 'completed',
+            'applied_action': {motor: uncertain.bus.raw[motor] for motor in ARM},
+        }
+        uncertain._guard_telemetry_t = 0.0
         uncertain._poll()
         assert_stop_hold_writes(uncertain.bus.writes)
+        expected = torque_case if torque_case != 'read_failure' else 'unknown'
+        assert uncertain.snapshot()['torque_state'] == expected
         names = {name for name, _motor in uncertain.bus.telemetry_reads}
-        assert {'Present_Temperature', 'Present_Current'} <= names, names
+        assert 'Present_Temperature' not in names, names
+        assert {'Present_Current', 'Present_Voltage'} <= names, names
+
+    # fresh ON이어도 목표 미정착 또는 pending 명령이 있으면 기존 hold 경계다.
+    for failure in ('unsettled', 'pending'):
+        guarded = Worker('/dev/fake', 'follower', base_interlock_provider=lambda: {
+            'active': False, 'reason': 'fake base lost', 'expires_at': 0.0})
+        guarded.bus = StopBus()
+        guarded.state.update(connected=True, calibrated=True, torque=True,
+                             torque_state='on', safety_ready=True,
+                             pan_lock=-15.6, pan_tol=7.0,
+                             pos=dict(guarded.bus.raw), pos_at=clock())
+        guarded.state['last_command'] = {
+            'id': 'cmd-arm', 'op': 'move_q', 'status': 'completed',
+            'applied_action': {motor: guarded.bus.raw[motor] for motor in ARM},
+        }
+        if failure == 'unsettled':
+            guarded.bus.goal['elbow_flex'] = 10.0
+        else:
+            guarded._commands['cmd-pending'] = {
+                'id': 'cmd-pending', 'op': 'speed', 'status': 'accepted'}
+        guarded._poll()
+        assert_stop_hold_writes(guarded.bus.writes[-2:], guarded.bus.raw)
 
     off = Worker('/dev/fake', 'follower', base_interlock_provider=lambda: {
         'active': False, 'reason': 'fake base lost', 'expires_at': 0.0})
@@ -255,7 +330,7 @@ def main():
                      torque_state='off', safety_ready=True,
                      pan_lock=-15.6, pan_tol=7.0,
                      pos=dict(off.bus.raw), pos_at=clock())
-    off._temp_t = 0.0
+    off._guard_telemetry_t = 0.0
     off._poll()
     assert not off.bus.writes and not off.bus.telemetry_reads
     print('PASS — hold/allow · spike/stale/owner/lease revoke · Worker default fail-closed')

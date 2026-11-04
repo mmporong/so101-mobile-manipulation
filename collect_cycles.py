@@ -26,11 +26,16 @@ import random
 import os
 import sys
 import time
+import urllib.error
 
 import numpy as np
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
+# pick_wrist는 이 값을 import 시 읽는다. main() 안에서 설정하면 이미 0.0으로
+# 고정된 뒤라 적용되지 않는다. 2026-08-28 실측에서 이 순서 버그 때문에 문서에
+# 적힌 -6mm 간격 보정이 사라져 아랫턱이 큐브를 강하게 눌렀다.
+os.environ.setdefault('GRASP_R_OFFSET_M', '-0.006')
 import arm_lib                                     # noqa: E402
 import pick_demo as pd                             # noqa: E402
 import pick_wrist as pw                            # noqa: E402
@@ -87,7 +92,21 @@ def rec(op, timeout=15, **kw):
         'http://127.0.0.1:8765/cmd', method='POST',
         data=_json.dumps(dict(op=op, **kw)).encode(),
         headers={'Content-Type': 'application/json'})
-    r = _json.load(urllib.request.urlopen(req, timeout=timeout))
+    try:
+        r = _json.load(urllib.request.urlopen(req, timeout=timeout))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read()
+            r = _json.loads(body)
+            if not isinstance(r, dict):
+                r = {'response': r}
+        except Exception:
+            r = {'msg': f'HTTP {exc.code}: {exc.reason}'}
+        # HTTP 상태가 실패이면 본문에 잘못된 {"ok": true}가 있어도 실패다.
+        # 레코더 시작을 성공으로 오판하면 기록되지 않는 실물 동작이 진행된다.
+        r['ok'] = False
+        r['http_status'] = int(exc.code)
+        r.setdefault('msg', f'HTTP {exc.code}')
     print(f'  [{op}] {r}')
     return r
 
@@ -126,9 +145,9 @@ def open_jaw(target=None):
     if target is None:
         target = pd.GRIP_OPEN.get('cube', 45)
     g0 = pd.get('/state')['pos'].get('gripper', 0)
-    pd.post('goto', joint='gripper', value=round(g0, 1))
+    pd.post_wait('goto', joint='gripper', value=round(g0, 1))
     time.sleep(0.3)
-    pd.post('goto', joint='gripper', value=target)
+    pd.post_wait('goto', joint='gripper', value=target)
     g = pd.wait_gripper_settle(target=target)
     if g is None or g < target - 8:
         sys.exit(f'죠가 안 열립니다 (지금 {g}) — 과부하 보호 상태일 수 있습니다')
@@ -176,7 +195,7 @@ def main():
     os.environ.setdefault('PICK_JITTER_M', '0.015')
     # ★ 파지 반지름 오프셋 (2026-08-26 "큐브가 아랫턱을 파고드는 형국"):
     # 팔을 6mm 뒤로 당겨 큐브가 죠 가운데 오게 한다 (여유 12.5mm 의 절반).
-    os.environ.setdefault('GRASP_R_OFFSET_M', '-0.006')   # 25→15mm: 자코비안 선형 구간 안 (2026-08-26)
+    # GRASP_R_OFFSET_M은 pick_wrist import 전에 위에서 설정한다.
 
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     st = pd.get('/state')
@@ -205,10 +224,10 @@ def main():
             r = None
             for _rt in range(4):                   # 데몬 재기동 순간 등 일시 실패 흡수
                 # ★ 손목캠 전용 기록 (2026-08-26): 정책 입력이 손목캠 하나로
-                # 확정됐고 차에는 뎁스캠을 싣지 않는다. 뎁스·포인트맵을 요구하면
-                # 뎁스캠 없는 환경에서 기록이 통째로 거부된다.
+                # 확정됐고 차에는 뎁스캠을 싣지 않는다. 서버가 받지 않는 폐기된
+                # depth·pointmap bool 필드는 보내지 않는다.
                 r = rec('rec_start', repo_id=REPO, task=TASK, fps=FPS,
-                        depth=False, pointmap=False, timeout=120)
+                        timeout=120)
                 if r.get('ok'):
                     break
                 print(f'  기록 시작 실패({r.get("msg")}) — 10초 뒤 재시도 {_rt+1}/3')

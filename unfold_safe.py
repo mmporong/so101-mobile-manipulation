@@ -14,6 +14,7 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
+from mission_history import write_step_result_from_env
 
 BASE = 'http://127.0.0.1:8765'
 K = None
@@ -90,9 +91,18 @@ def state():
     return json.load(urllib.request.urlopen(f'{BASE}/state', timeout=10))
 
 
-def bail(msg):
+def bail(msg, recorder=None):
     # 토크는 유지한다 (2026-08-25 전수 정비) — 서 있는 팔에서 토크 OFF 는 낙하다.
     stopped = True
+    if recorder is not None:
+        try:
+            recorder.submit(
+                'mission_hold', api=BASE, reason=str(msg)[:160],
+                expected_worker_op='mission_hold', wait_timeout=30.0,
+                request_timeout=3.0)
+        except Exception as e:
+            stopped = False
+            print(f'Worker hold 증거 실패: {type(e).__name__} — stop도 요청합니다')
     try:
         post('stop')
     except Exception as e:
@@ -203,13 +213,14 @@ def plan_waypoints(st, bounds=None):
 
 
 def main(bounds=None):
+    recorder = arm_lib.AppliedCommandRecorder()
     st = state()
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 상태가 아닙니다')
     try:
         z0, work, waypoints, speeds, joints = plan_waypoints(st, bounds=bounds)
     except RuntimeError as e:
-        bail(str(e))
+        bail(str(e), recorder)
     print(f'시작 z={z0:+.4f}m · 자세 '
           f'{({k: round(st["pos"][k], 1) for k in J})}')
     if st.get('pan_lock') is not None:
@@ -217,7 +228,12 @@ def main(bounds=None):
 
     if not waypoints:
         print('이미 작업 자세라 이동하지 않습니다')
-        return
+        metrics = recorder.metrics(
+            no_motion=True, operational_scope='unfold_no_metric_or_collision_context')
+        write_step_result_from_env(
+            'unfold_safe.py', 'complete', metrics=metrics,
+            details={'execution_scope': 'already_unfolded_no_worker_motion'})
+        return metrics
 
     import smooth_move as sm
     start = {j: st['pos'][j] for j in J}
@@ -229,18 +245,36 @@ def main(bounds=None):
     print(f'shoulder_lift {shoulder_segments}구간 · '
           f'{SHOULDER_LIFT_SPEED_DPS:.1f}°/s')
     if zmin_plan < min(z0, -0.02) - 0.004:
-        bail(f'계획 경로 z 위반 ({zmin_plan:+.4f}) — 실행하지 않습니다')
+        bail(f'계획 경로 z 위반 ({zmin_plan:+.4f}) — 실행하지 않습니다', recorder)
+    original_post = sm._post
+
+    def tracked_post(op, timeout=3.0, **payload):
+        return recorder.submit(
+            op, api=BASE, request_timeout=timeout,
+            wait_timeout=max(10.0, float(timeout)), **payload)
+
+    sm._post = tracked_post
     try:
         sm.stream(ticks, z_floor=min(z0, zmin_plan) - 0.012)
     except KeyboardInterrupt:
-        bail('사용자 중단')
+        bail('사용자 중단', recorder)
     except RuntimeError as e:
-        bail(str(e))
+        bail(str(e), recorder)
+    finally:
+        sm._post = original_post
 
     s = state()
     print(f'\n작업 자세 도달. z={fk_z(s["pos"]):+.4f}m · '
           f'자세 {({k: round(v,1) for k,v in s["pos"].items()})}')
-    print('온도:', s.get('temp'), '· 전류:', s.get('current'))
+    print('전류:', s.get('current'), '· 온도 소프트웨어 판독 OFF')
+    metrics = recorder.metrics(
+        no_motion=False, operational_scope='unfold_no_metric_or_collision_context',
+        waypoint_count=len(waypoints), streamed_tick_count=len(ticks),
+        planned_min_z_m=zmin_plan)
+    write_step_result_from_env(
+        'unfold_safe.py', 'complete', metrics=metrics,
+        details={'execution_scope': 'arm_unfold_only_no_target_or_attachment'})
+    return metrics
 
 
 if __name__ == '__main__':

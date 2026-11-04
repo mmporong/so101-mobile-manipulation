@@ -9,6 +9,9 @@ import threading
 import time
 import tempfile
 import json
+import math
+
+import arm_lib
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from arm_gui import ALL, ARM, Worker, make_gui_close_handler
@@ -72,9 +75,18 @@ class Bus:
 def worker():
     w = Worker('/dev/fake', 'follower', base_interlock_provider=lambda: {
         'active': True, 'reason': 'stationary', 'expires_at': 1e12})
+    # 이 스위트의 기존 카메라 epoch/dirty 테스트는 레거시 팬·틸트가 있는
+    # 구성을 명시적으로 모델링한다. 차량 손목캠 전용(false)은 별도 테스트가
+    # 실제 운영 프로필대로 검증한다.
+    w.profile = dict(w.profile, camera_axes_enabled=True)
     # 동시성 계약은 저장소 밖 ROS FK가 아니라 명령 epoch·STOP 상태 전이를 본다.
     # rearm의 기하 입력은 안전한 결정론적 fixture로 고정한다.
     w._tcp_z = lambda _servo: 0.0
+    # 동시성 검사에서 첫 cam_snapshot이 lerobot→torch 전체를 느리게
+    # import하면 1초 STOP terminal 게이트가 기기 속도에 따라 흔들린다.
+    # 카메라 패킷 경합은 별도 테스트가 직접 _cam_read/_cam_write를
+    # 주입하므로 공통 fixture의 유휴 스냅샷은 결정론적으로 고정한다.
+    w.cam_snapshot = lambda: {'home': None, 'axes': {}, 'at_home': None}
     w.bus = Bus()
     w._calib_cache = {m: {'range_min': 0, 'range_max': 4095} for m in ALL}
     w.state.update(connected=True, calibrated=True, torque=True,
@@ -133,7 +145,7 @@ def test_atomic_stop_and_listener():
     assert not w.is_alive()
 
 
-def test_confirmed_overheat_latches_before_hold_and_stops_stream():
+def test_temperature_value_never_interrupts_stream():
     w = worker()
     w.bus.read = lambda name, motor, normalize=False: (
         65 if name == 'Present_Temperature'
@@ -143,8 +155,7 @@ def test_confirmed_overheat_latches_before_hold_and_stops_stream():
         else 50)
     w._swept_floor_reason = lambda *_args, **_kwargs: None
     w._motion_tick_ready = lambda _goal: (True, 'ok')
-    w._hot_pending = {m: 65 for m in ALL}
-    w._temp_t = 0.0
+    w._guard_telemetry_t = 0.0
     cur = {m: w.bus.pos[m] for m in ARM}
     target = {m: cur[m] + 20.0 for m in ARM}
     result = []
@@ -153,37 +164,14 @@ def test_confirmed_overheat_latches_before_hold_and_stops_stream():
     deadline = time.monotonic() + 1.0
     while not w.bus.goal_writes and time.monotonic() < deadline:
         time.sleep(0.002)
-    assert w.bus.goal_writes, '과열 주입 전에 보간이 시작되지 않음'
-
-    old_epoch = w._actuation_epoch
-    hold_boundary = []
-    sync_write = w.bus.sync_write
-
-    def observe_stop_boundary(name, values, normalize=True):
-        if name == 'Goal_Position' and not normalize and set(values) == set(ARM):
-            hold_boundary.append((w._stop_latched.is_set(), w.abort.is_set(),
-                                  w._actuation_epoch))
-        return sync_write(name, values, normalize)
-
-    w.bus.sync_write = observe_stop_boundary
+    assert w.bus.goal_writes, '온도 무시 검증 전에 보간이 시작되지 않음'
     w._guard(w.snapshot())
-    writes_after_synchronous_stop = len(w.bus.goal_writes)
-    motion.join(1.0)
+    motion.join(1.5)
 
-    assert result == [False] and not motion.is_alive()
+    assert result == [True] and not motion.is_alive()
     state = w.snapshot()
-    assert state['stop_latched'] is True and w.abort.is_set()
-    assert state['actuation_epoch'] == old_epoch + 1
-    assert hold_boundary == [(True, True, old_epoch + 1)], (
-        '과열 hold 전에 STOP latch/abort/epoch가 원자적으로 적용되지 않음')
-    assert w._stop_applied_epoch == state['actuation_epoch']
-    assert len(w.bus.goal_writes) == writes_after_synchronous_stop, (
-        '확인된 과열 정지 뒤 보간 Goal_Position이 다시 기록됨')
-    assert w._do_rearm() is None, '새 epoch 권위 없는 rearm이 허용됨'
-    w._active_command_epoch = w._actuation_epoch
-    assert w._do_rearm() is True
-    w._active_command_epoch = None
-    assert w.snapshot()['stop_latched'] is False
+    assert state['stop_latched'] is False and not w.abort.is_set()
+    assert state['temperature_monitoring'] is False and state['temp'] == {}
 
 
 def test_shutdown_terminalizes_every_command():
@@ -318,6 +306,44 @@ def test_torque_off_terminal_requires_exact_off_readback():
     state = w.snapshot()
     assert state['torque_state'] == 'unknown' and not state['safety_ready']
     assert w.shutdown('done', 1.0)
+
+
+def test_torque_off_after_stop_is_completed_not_epoch_rejected():
+    w = worker()
+    w.start()
+    stop_id = w.stop_and_cancel('operator stop before torque off')
+    assert w.wait_command(stop_id, 1.0)['status'] == 'completed'
+
+    command_id = w.submit('torque', False)
+    terminal = w.wait_command(command_id, 1.0)
+    assert terminal['status'] == 'completed', terminal
+    state = w.snapshot()
+    assert state['torque'] is False and state['torque_state'] == 'off'
+    assert state['stop_latched'] is True
+    assert w.shutdown('done', 1.0)
+
+
+def test_depth_free_stop_skips_disabled_camera_axes():
+    w = worker()
+    w.profile = dict(w.profile, camera_axes_enabled=False)
+
+    class ForbiddenPacket:
+        calls = 0
+
+        def __getattr__(self, _name):
+            self.calls += 1
+            raise AssertionError('depth-free STOP이 카메라 팬/틸트 버스에 접근함')
+
+    packet = ForbiddenPacket()
+    w.bus.packet_handler = packet
+    w.bus.port_handler = object()
+    w._active_command_op = 'stop'
+    assert w._do_stop() is True
+    assert packet.calls == 0
+    assert w._last_stop_evidence == {
+        'arm': True, 'gripper': True, 'camera': True}
+    snapshot = Worker.cam_snapshot(w)
+    assert snapshot['enabled'] is False and snapshot['axes'] == {}
 
 
 def test_request_stop_interrupts_inflight_camera_home(tmp_dir=None):
@@ -670,11 +696,43 @@ def test_raw_tuple_is_not_dispatched_and_retention_is_bounded():
     assert not hasattr(w, '_terminal_emitted') or len(w._terminal_emitted) <= 256
 
 
+def test_move_q_status_exposes_duration_target_timestamps_and_tracking():
+    w = worker()
+    mapping = arm_lib.load_mapping()
+    target = dict(w.state['pos'], wrist_roll=48.2)
+    q = [math.radians(
+        (target[joint] - mapping['offsets'][joint])
+        / mapping['signs'][joint]) for joint in ARM]
+    command_id = w.submit('move_q', q, 8.0)
+    accepted = w.command_status(command_id)
+    assert accepted['target_joints_deg']['wrist_roll'] == 48.2
+    assert accepted['expected_duration_s'] > 8.0
+    assert accepted['recommended_wait_timeout_s'] > accepted['expected_duration_s']
+    assert accepted['accepted_wall_time'] is not None
+    assert accepted['executing_at'] is None and accepted['terminal_at'] is None
+
+    with w.lock:
+        item = w._commands[command_id]
+        item['status'] = 'executing'
+        item['executing_at'] = time.monotonic()
+        item['executing_wall_time'] = time.time()
+    w._active_command_id = command_id
+    observed = dict(target, wrist_roll=40.0)
+    w._record_joint_tracking(observed, target)
+    w._finish_command(command_id, 'rejected', reason='fixture terminal')
+    terminal = w.command_status(command_id)
+    assert terminal['terminal_at'] is not None
+    assert terminal['terminal_wall_time'] is not None
+    assert terminal['actual_duration_s'] >= 0.0
+    assert terminal['joint_tracking_error_deg']['wrist_roll'] == 8.2
+    assert terminal['peak_joint_tracking_error_deg']['wrist_roll'] == 8.2
+
+
 def main():
     test_atomic_stop_and_listener()
     print('PASS — atomic stop · write gate · terminal listener')
-    test_confirmed_overheat_latches_before_hold_and_stops_stream()
-    print('PASS — confirmed overheat synchronous STOP epoch · zero late goals')
+    test_temperature_value_never_interrupts_stream()
+    print('PASS — software temperature read disabled · stream uninterrupted')
     test_shutdown_terminalizes_every_command()
     print('PASS — graceful shutdown terminalizes all commands')
     test_threaded_shutdown_rejects_unproven_stop_and_preserves_ownership()
@@ -685,6 +743,10 @@ def main():
     print('PASS — sequential torque enable stop race ×20')
     test_torque_off_terminal_requires_exact_off_readback()
     print('PASS — torque OFF terminal requires exact OFF readback')
+    test_torque_off_after_stop_is_completed_not_epoch_rejected()
+    print('PASS — STOP latch 뒤 torque OFF terminal completed')
+    test_depth_free_stop_skips_disabled_camera_axes()
+    print('PASS — depth-free STOP skips disabled camera axes')
     test_request_stop_interrupts_inflight_camera_home()
     print('PASS — request_stop interrupts inflight camera-home')
     test_stop_epoch_rejects_late_and_camera_writes()
@@ -695,6 +757,8 @@ def main():
     print('PASS — Worker camera physical dirty marker · register I/O zero')
     test_raw_tuple_is_not_dispatched_and_retention_is_bounded()
     print('PASS — tracked dispatch only · 5000 command bounded retention')
+    test_move_q_status_exposes_duration_target_timestamps_and_tracking()
+    print('PASS — move_q duration/target/timestamps/joint tracking trace')
     test_common_terminal_contract_and_device_lock()
     print('PASS — common terminal contract · OS device authority lock')
     test_camera_packet_errors_fail_and_rearm_needs_connection()

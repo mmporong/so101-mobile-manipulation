@@ -7,6 +7,9 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
+import urllib.error
+import json
 
 import numpy as np
 
@@ -44,10 +47,13 @@ def test_target_lock():
 def good_snapshot():
     return ({'connected': True, 'calibrated': True}, (288, 352, 3), {
         'seen': ['/odom', '/scan', '/battery_state'],
+        'battery': {'voltage_v': 12.4, 'present': True, 'age_s': 0.1},
         'cmd_vel_publishers': [('collision_monitor', '/')],
         'cmd_vel_subscribers': [('jdamr_base_driver', '/')],
+        'cmd_vel_input_publishers': [],
         'base_motion': {'cmd_vel': [0.0, 0.0], 'odom': [0.0, 0.0],
-                        'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1},
+                        'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1,
+                        'command_source': 'no_input_owner'},
     })
 
 
@@ -58,11 +64,16 @@ def test_preflight_policy():
     errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
     assert any('정지 증거가 없음' in e for e in errors), errors
     ros['base_motion'] = {'cmd_vel': [0.0, 0.0], 'odom': [0.0, 0.0],
-                          'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1}
+                          'cmd_vel_age_s': 0.1, 'odom_age_s': 0.1,
+                          'command_source': 'no_input_owner'}
     ros['cmd_vel_publishers'].append(('web_teleop', '/'))
     errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
     assert any('하나여야' in e for e in errors), errors
     ros['cmd_vel_publishers'] = [('collision_monitor', '/')]
+    ros['cmd_vel_input_publishers'] = [('web_teleop', '/')]
+    errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
+    assert any('입력 소유자' in e for e in errors), errors
+    ros['cmd_vel_input_publishers'] = []
     ros['base_motion']['cmd_vel_age_s'] = 0.6
     errors = P.evaluate(panel, shape, ros, require_motion_stack=True)
     assert any('freshness 초과' in e for e in errors), errors
@@ -75,6 +86,25 @@ def test_preflight_policy():
     errors = P.evaluate(panel, shape, ros)
     assert any('/scan' in e for e in errors), errors
     ros['seen'].append('/scan')
+    ros['battery']['voltage_v'] = 9.68
+    errors = P.evaluate(panel, shape, ros)
+    assert any('배터리 저전압 9.680V' in e for e in errors), errors
+    ros['battery']['voltage_v'] = 10.499
+    errors = P.evaluate(panel, shape, ros)
+    assert any('10.499V (<10.500V)' in e for e in errors), errors
+    ros['battery']['voltage_v'] = 10.5
+    assert not any('배터리' in e for e in P.evaluate(panel, shape, ros))
+    ros['battery']['age_s'] = 2.5
+    assert not any('배터리' in e for e in P.evaluate(panel, shape, ros))
+    ros['battery']['age_s'] = 2.500001
+    errors = P.evaluate(panel, shape, ros)
+    assert any('배터리 최신 데이터' in e for e in errors), errors
+    ros['battery']['age_s'] = 0.1
+    ros['battery']['present'] = False
+    errors = P.evaluate(panel, shape, ros)
+    assert any('배터리 센서 미검출' in e for e in errors), errors
+    ros['battery']['present'] = True
+    ros['battery']['voltage_v'] = 12.4
     ros['cmd_vel_subscribers'] = [('jdamr_base_driver', '/other')]
     errors = P.evaluate(panel, shape, ros)
     assert any('루트 jdamr_base_driver' in e for e in errors), errors
@@ -109,6 +139,84 @@ def test_stream_early_end_fails():
         Y.load_model, Y.open_frames = old_model, old_frames
 
 
+def test_atomic_frame_retries_lazy_camera_503():
+    import cv2
+
+    ok, encoded = cv2.imencode('.jpg', np.zeros((8, 9, 3), np.uint8))
+    assert ok
+
+    class Response:
+        headers = {
+            'X-Frame-Sequence': '7',
+            'X-Frame-Captured-At': str(time.monotonic()),
+            'X-Frame-Age': '0.01',
+        }
+
+        def read(self):
+            return encoded.tobytes()
+
+        def close(self):
+            pass
+
+    calls = {'count': 0}
+
+    def http_error(code, reason):
+        body = io.BytesIO(json.dumps({'error': reason}).encode())
+        return urllib.error.HTTPError(
+            'http://fake/frame.jpg', code, reason, {}, body)
+
+    def lazy_urlopen(url, timeout=None):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            raise http_error(503, 'camera frame stale')
+        return Response()
+
+    original = Y.urllib.request.urlopen
+    Y.urllib.request.urlopen = lazy_urlopen
+    try:
+        image, meta = Y.read_atomic_frame(timeout=0.5)
+    finally:
+        Y.urllib.request.urlopen = original
+    assert image.shape == (8, 9, 3) and meta['sequence'] == 7
+    assert calls['count'] == 2, calls
+
+    def expect_failure(opener, error_type, text):
+        count = {'value': 0}
+
+        def counted(*args, **kwargs):
+            count['value'] += 1
+            return opener(*args, **kwargs)
+
+        Y.urllib.request.urlopen = counted
+        try:
+            Y.read_atomic_frame(timeout=0.12)
+        except error_type as exc:
+            assert text in str(exc), exc
+        else:
+            raise AssertionError(f'{text} 오류를 성공으로 처리함')
+        finally:
+            Y.urllib.request.urlopen = original
+        return count['value']
+
+    assert expect_failure(
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            http_error(503, 'camera off')),
+        RuntimeError, 'camera off') == 1
+    assert expect_failure(
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            http_error(404, 'not found')),
+        urllib.error.HTTPError, '404') == 1
+    assert expect_failure(
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            urllib.error.URLError('network timeout')),
+        urllib.error.URLError, 'network timeout') == 1
+    stale_calls = expect_failure(
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            http_error(503, 'camera frame stale')),
+        RuntimeError, 'camera frame stale')
+    assert 2 <= stale_calls <= 5, stale_calls
+
+
 def test_environment_contract():
     text = (HERE / 'laptop_ros_env.sh').read_text()
     assert 'export ROS_DOMAIN_ID=12' in text
@@ -136,6 +244,13 @@ def test_environment_contract():
     assert 'does-not-resolve.invalid' not in output
 
 
+def test_dashboard_starts_inside_ros_environment():
+    text = (HERE / 'panel_restart.sh').read_text()
+    assert 'ROS_ENV="$HOME/so101-mobile-manipulation/laptop_ros_env.sh"' in text
+    assert 'setsid nohup bash "$ROS_ENV" "$PY" -u panel_server.py' in text
+    subprocess.run(['bash', '-n', str(HERE / 'panel_restart.sh')], check=True)
+
+
 def test_headless_scripts_prime_real_frame():
     for name in ('run_batch.sh', 'run_demo.sh'):
         text = (HERE / name).read_text()
@@ -147,7 +262,9 @@ def test_headless_scripts_prime_real_frame():
 def main():
     tests = [test_mjpeg_parser, test_target_lock, test_preflight_policy,
              test_read_only_contract, test_stream_early_end_fails,
-             test_environment_contract, test_headless_scripts_prime_real_frame]
+             test_atomic_frame_retries_lazy_camera_503,
+             test_environment_contract, test_dashboard_starts_inside_ros_environment,
+             test_headless_scripts_prime_real_frame]
     for test in tests:
         test()
         print(f'PASS — {test.__name__}')

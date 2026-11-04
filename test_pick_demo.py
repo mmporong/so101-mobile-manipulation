@@ -11,8 +11,10 @@
 """
 import json
 import math
+import os
 import pathlib
 import sys
+import tempfile
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -23,6 +25,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import arm_lib
 import pick_demo as pd
 from test_place_down import FakeArm, make_handler
+
+
+def test_csv_log_failure_is_diagnostic(capsys):
+    old = pd.CSV_LOG
+    with tempfile.TemporaryDirectory() as directory:
+        pd.CSV_LOG = pathlib.Path(directory)
+        try:
+            assert pd.csv_log(result='fail') is False
+        finally:
+            pd.CSV_LOG = old
+    assert 'CSV 기록 실패' in capsys.readouterr().err
 
 HE = json.loads((pathlib.Path(__file__).parent / 'handeye.json').read_text())
 R, T = np.array(HE['R']), np.array(HE['t'])
@@ -84,17 +97,28 @@ def synth_blob(x, y, yaw_deg, h_center=0.011, axis=True):
     return blob
 
 
-def run_case(name, blob, expect_exit=None, expect_sub='', pose='lying'):
+def run_case(name, blob, expect_exit=None, expect_sub='', pose='lying',
+             grasp_verdict='follow'):
     arm = FakeArm((0.19, 0.0, 0.02), 50.0)      # 작업 자세·그리퍼 열림에서 시작
     arm.blob = blob
+    arm.grasp_verdict = grasp_verdict
     srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
     old, sys.argv = sys.argv, ['pick_demo.py', pose, '--legacy-bench']
     old_pd_time = pd.time
+    old_settle = pd.wait_gripper_settle
     old_sleep = time.sleep
     FastTime.now = 0.0
     pd.time = FastTime
+
+    def simulated_cube_contact(timeout=35.0, target=None):
+        value = old_settle(timeout=timeout, target=target)
+        if target is None and value <= pd.GRIP_EMPTY_MAX:
+            return 14.9
+        return value
+
+    pd.wait_gripper_settle = simulated_cube_contact
     # grip_close_ramp()가 함수 안에서 표준 time을 다시 import한다. 네트워크
     # 요청 순서는 그대로 두고 그 램프의 벽시계 대기만 제거한다.
     time.sleep = lambda _seconds: old_sleep(0)
@@ -105,12 +129,16 @@ def run_case(name, blob, expect_exit=None, expect_sub='', pose='lying'):
         code = e.code
     finally:
         pd.time = old_pd_time
+        pd.wait_gripper_settle = old_settle
         time.sleep = old_sleep
         sys.argv = old
         srv.shutdown()
         srv.server_close()
     if expect_exit is None:
         assert code is None, f'{name}: 예상외 종료 — {code}'
+    else:
+        assert code is not None and expect_sub in str(code), \
+            f'{name}: 기대 {expect_sub!r} ≠ {code!r}'
     print(f'  {name}: OK')
     return arm
 
@@ -120,6 +148,174 @@ def ik_rolls(arm):
 
 
 def main():
+    print('① 중단은 tracked STOP terminal 완료 후에만 반환한다')
+    events = []
+    old_post, old_wait = pd.post, pd.post_wait
+    old_run_id = os.environ.get('SO101_MISSION_RUN_ID')
+    try:
+        os.environ['SO101_MISSION_RUN_ID'] = 'hard-fault-run'
+        pd.post = lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError('미추적 STOP 사용'))
+
+        def completed_stop(op, **kw):
+            events.extend(('accepted', 'completed'))
+            assert op == 'worker_hard_hold'
+            assert kw == {
+                'wait_timeout': 10.0,
+                'reason': '모의 Worker 실패'}
+            return {'status': 'completed'}
+
+        pd.post_wait = completed_stop
+        try:
+            pd.bail(
+                '모의 Worker 실패',
+                worker_error=arm_lib.WorkerCommandError(
+                    'cmd timeout', command_id='cmd-00002732',
+                    status={'id': 'cmd-00002732', 'status': 'executing'}))
+        except SystemExit as exc:
+            events.append('exit')
+            assert '모의 Worker 실패' in str(exc)
+        else:
+            raise AssertionError('bail이 SystemExit를 발생시키지 않음')
+    finally:
+        pd.post, pd.post_wait = old_post, old_wait
+        if old_run_id is None:
+            os.environ.pop('SO101_MISSION_RUN_ID', None)
+        else:
+            os.environ['SO101_MISSION_RUN_ID'] = old_run_id
+    assert events == ['accepted', 'completed', 'exit'], events
+    assert pd.LAST_WORKER_COMMAND_ERROR['command_id'] == 'cmd-00002732'
+    assert pd.LAST_WORKER_COMMAND_ERROR['command_status']['status'] == 'executing'
+
+    print('② 닫힘 램프는 모든 Worker 명령의 terminal 완료를 확인한다')
+    calls = []
+    old_get, old_wait, old_sleep = pd.get, pd.post_wait, time.sleep
+    try:
+        pd.get = lambda _path: {'pos': {'gripper': 45.0}}
+        pd.post_wait = lambda op, **kw: calls.append((op, kw)) or {
+            'status': 'completed'}
+        time.sleep = lambda _seconds: None
+        pd.grip_close_ramp(7.0, steps=2, dt=0.0)
+    finally:
+        pd.get, pd.post_wait, time.sleep = old_get, old_wait, old_sleep
+    assert calls == [
+        ('goto', {'joint': 'gripper', 'value': 45.0}),
+        ('grip_force', {'pct': 45}),
+        ('goto', {'joint': 'gripper', 'value': 26.0}),
+        ('goto', {'joint': 'gripper', 'value': 7.0}),
+    ], calls
+
+    print('② 닫힘 단계 terminal 거부 후 다음 목표를 보내지 않는다')
+    calls = []
+    old_get, old_wait, old_sleep = pd.get, pd.post_wait, time.sleep
+    try:
+        pd.get = lambda _path: {'pos': {'gripper': 45.0}}
+
+        def reject_second_goto(op, **kw):
+            calls.append((op, kw))
+            if op == 'goto' and kw.get('value') == 26.0:
+                raise arm_lib.WorkerCommandError('lease 만료')
+            return {'status': 'completed'}
+
+        pd.post_wait = reject_second_goto
+        time.sleep = lambda _seconds: None
+        try:
+            pd.grip_close_ramp(7.0, steps=2, dt=0.0)
+        except arm_lib.WorkerCommandError as exc:
+            assert 'lease 만료' in str(exc)
+        else:
+            raise AssertionError('terminal 거부 후에도 닫힘 램프가 완주함')
+    finally:
+        pd.get, pd.post_wait, time.sleep = old_get, old_wait, old_sleep
+    assert calls[-1] == ('goto', {'joint': 'gripper', 'value': 26.0})
+    assert not any(kw.get('value') == 7.0 for _op, kw in calls)
+
+    print('③ 안전 임대 만료 중간 각도를 파지로 오판하지 않는다')
+    old_get, old_pd_time, old_wait = pd.get, pd.time, pd.post_wait
+    neutralizing = []
+    try:
+        FastTime.now = 0.0
+        pd.time = FastTime
+        pd.post_wait = lambda op, **kw: neutralizing.append((op, kw)) or {
+            'status': 'completed'}
+        pd.get = lambda _path: {
+            'connected': True, 'calibrated': True,
+            'torque': True, 'torque_state': 'on',
+            'safety_ready': False, 'safety_reason': '팔 단독 시험 lease 만료',
+            'stop_latched': True, 'base_interlock_active': False,
+            'base_interlock_reason': '팔 단독 시험 lease 만료',
+            'pos': {'gripper': 26.7},
+        }
+        try:
+            pd.wait_gripper_settle(timeout=3.0)
+        except arm_lib.WorkerCommandError as exc:
+            assert 'lease 만료' in str(exc), exc
+        else:
+            raise AssertionError('안전 임대 만료 후 26.7°를 파지로 인정함')
+    finally:
+        pd.get, pd.time = old_get, old_pd_time
+
+    print('④ 정착 제한시간이 끝나면 마지막 각도를 반환하지 않는다')
+    old_get, old_pd_time = pd.get, pd.time
+    try:
+        FastTime.now = 0.0
+        pd.time = FastTime
+        pd.get = lambda _path: {
+            'connected': True, 'calibrated': True,
+            'torque': True, 'torque_state': 'on',
+            'safety_ready': True, 'safety_reason': 'test',
+            'stop_latched': False, 'base_interlock_active': True,
+            'base_interlock_reason': 'test', 'pos': {'gripper': 24.7},
+        }
+        try:
+            pd.wait_gripper_settle(timeout=2.5)
+        except arm_lib.WorkerCommandError as exc:
+            assert '정착하지 않았' in str(exc) and '24.7°' in str(exc)
+        else:
+            raise AssertionError('정착 타임아웃 각도를 파지 결과로 반환함')
+    finally:
+        pd.get, pd.time, pd.post_wait = old_get, old_pd_time, old_wait
+    assert neutralizing == [
+        ('goto', {'joint': 'gripper', 'value': 24.7})], neutralizing
+
+    print('⑤ 타임아웃 hold 실패 시 tracked STOP으로 폴백한다')
+    old_get, old_pd_time, old_wait = pd.get, pd.time, pd.post_wait
+    neutralizing = []
+    try:
+        FastTime.now = 0.0
+        pd.time = FastTime
+        pd.get = lambda _path: {
+            'connected': True, 'calibrated': True,
+            'torque': True, 'torque_state': 'on',
+            'safety_ready': True, 'safety_reason': 'test',
+            'stop_latched': False, 'base_interlock_active': True,
+            'base_interlock_reason': 'test', 'pos': {'gripper': 24.7},
+        }
+
+        def fail_hold_then_stop(op, **kw):
+            neutralizing.append((op, kw))
+            if op == 'goto':
+                raise arm_lib.WorkerCommandError('hold 거부')
+            return {'status': 'completed'}
+
+        pd.post_wait = fail_hold_then_stop
+        try:
+            pd.wait_gripper_settle(timeout=2.5)
+        except arm_lib.WorkerCommandError as exc:
+            assert 'STOP 완료' in str(exc)
+        else:
+            raise AssertionError('hold 실패 후 타임아웃이 성공으로 반환됨')
+    finally:
+        pd.get, pd.time, pd.post_wait = old_get, old_pd_time, old_wait
+    assert [op for op, _kw in neutralizing] == ['goto', 'stop'], neutralizing
+
+    source = pathlib.Path(pd.__file__).read_text()
+    legacy_close = source[source.index("print('④ 파지')"):]
+    legacy_close = legacy_close[
+        :legacy_close.index("post_wait('speed', pct=100)")]
+    assert "post_wait('goto', joint='gripper', value=round(g, 1))" in legacy_close
+
+    print('⑥ 방향 파지 모의 리허설')
     px, py = 0.19, 0.02                      # 물체 실좌표 (파지목표 = -OFF 보정)
     tx, ty = px - OFF[0], py - OFF[1]        # pick_demo 의 파지 목표
     pan = math.degrees(math.atan2(ty, tx))
@@ -166,6 +362,16 @@ def main():
     expect = ((psi - pan - pd.CLOSE_AXIS + 45) % 90) - 45
     assert rolls and all(abs(r - expect) < 6 for r in rolls), \
         f'대각 큐브 롤 기대 {expect:+.1f}±6 ≠ {rolls}'
+
+    print('④-1 시각 추적에서 놓침이면 성공 종료하지 않는다')
+    run_case('시각놓침', synth_blob(px, py, pan),
+             expect_exit=True, expect_sub='파지 확인 실패',
+             grasp_verdict='miss')
+
+    print('④-2 시각 관측 부족이면 성공 종료하지 않는다')
+    run_case('판정불가', synth_blob(px, py, pan),
+             expect_exit=True, expect_sub='파지 판정 불가',
+             grasp_verdict='missing')
 
     print('⑤ 큐브 깊이 표본 부족 → 강등 없이 중단 (fail-closed)')
     blob = synth_blob(px, py, 0, h_center=0.020, axis=False)   # pix 없음

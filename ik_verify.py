@@ -49,7 +49,9 @@ def main():
                     help='실행 중인 패널 Worker API')
     ap.add_argument('--port', help=argparse.SUPPRESS)
     ap.add_argument('--id', help=argparse.SUPPRESS)
+    arm_lib.add_execute_argument(ap)
     a = ap.parse_args()
+    arm_lib.apply_execute_flag(a)
 
     if a.port is not None or a.id is not None:
         ap.error('--port/--id 직접 연결은 폐기되었습니다. --api로 패널 Worker를 지정하세요')

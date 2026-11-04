@@ -48,6 +48,61 @@ class FixtureKinematics:
         return (0.2, 0.0, arm_lib.PAN0[2] + z)
 
 
+def _ready_state(position=None):
+    return {'connected': True, 'calibrated': True, 'torque': True,
+            'pan_lock': None, 'pos': dict(position or U.WORK),
+            'current': {}, 'log': []}
+
+
+def test_unfold_no_motion_writes_explicit_empty_trace(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(U, 'state', lambda: _ready_state())
+    monkeypatch.setattr(U, 'plan_waypoints', lambda *_a, **_k: (
+        0.1, dict(U.WORK), [], [], []))
+    monkeypatch.setattr(U, 'write_step_result_from_env',
+                        lambda *args, **kwargs: captured.update(
+                            args=args, kwargs=kwargs))
+    metrics = U.main(bounds=FIXTURE_BOUNDS)
+    assert metrics['no_motion'] is True
+    assert metrics['applied_commands'] == []
+    assert metrics['applied_commands_schema'] == 'so101.applied_commands.v1'
+    assert captured['kwargs']['metrics'] == metrics
+
+
+def test_unfold_stream_collects_every_worker_terminal(monkeypatch):
+    import smooth_move as sm
+    commands = []
+    position = dict(U.WORK)
+    position['wrist_flex'] -= 2.0
+    monkeypatch.setattr(U, 'state', lambda: _ready_state(position))
+    monkeypatch.setattr(U, 'plan_waypoints', lambda *_a, **_k: (
+        0.05, dict(U.WORK), [dict(U.WORK)], [6.0], ['wrist_flex']))
+    monkeypatch.setattr(U, 'fk_z', lambda _pose: 0.05)
+    monkeypatch.setattr(sm, 'plan', lambda *_a, **_k: [dict(U.WORK)])
+    monkeypatch.setattr(sm, 'sweep_z', lambda _ticks: 0.04)
+
+    def submit(op, **kwargs):
+        commands.append((op, kwargs))
+        return {'id': f'cmd-{len(commands)}', 'op': op, 'status': 'completed',
+                'expected_duration_s': 0.5,
+                'applied_action': {'wrist_flex': U.WORK['wrist_flex']}}
+    monkeypatch.setattr(arm_lib, 'worker_submit_wait', submit)
+
+    def stream(_ticks, **_kwargs):
+        sm._post('teleop_profile', on=True, timeout=10.0)
+        sm._post('pose', joints=dict(U.WORK), timeout=2.0)
+        sm._post('teleop_profile', on=False, timeout=10.0)
+        return dict(U.WORK)
+    monkeypatch.setattr(sm, 'stream', stream)
+    monkeypatch.setattr(U, 'write_step_result_from_env', lambda *_a, **_k: None)
+    metrics = U.main(bounds=FIXTURE_BOUNDS)
+    rows = metrics['applied_commands']
+    assert [row['op'] for row in rows] == ['teleop_profile', 'pose', 'teleop_profile']
+    assert all(row['terminal_complete'] is True for row in rows)
+    assert all(call[1]['require_applied'] is True for call in commands)
+    assert metrics['no_motion'] is False
+
+
 def main():
     assert U.K is None and U.MP is None, 'unfold_safe import가 런타임 기하를 미리 읽음'
     U.K, U.MP = FixtureKinematics(), FIXTURE_MAPPING
@@ -179,18 +234,25 @@ def main():
             'pos': dict(PARKED), 'pan_lock': -15.6,
             'temp': {}, 'current': {}}
     calls = []
-    old_u_state, old_sm_state, old_stream, old_sweep = (
-        U.state, sm._state, sm.stream, sm.sweep_z)
+    old_u_state, old_sm_state, old_stream, old_sweep, old_submit = (
+        U.state, sm._state, sm.stream, sm.sweep_z,
+        arm_lib.worker_submit_wait)
     U.state = lambda: fake
     sm._state = lambda timeout=3.0: {'pan_lock': -15.6}
     sm.sweep_z = lambda _ticks: -0.03
-    sm.stream = lambda ticks, hz=15.0, z_floor=None: calls.append(
-        {'ticks': len(ticks), 'z_floor': z_floor})
+    def complete_submit(op, **_kwargs):
+        return {'id': f'cmd-{len(calls) + 1}', 'op': op, 'status': 'completed',
+                'expected_duration_s': 1.0, 'applied_action': {'fixture': True}}
+    arm_lib.worker_submit_wait = complete_submit
+    def one_traced_stream(stream_ticks, hz=15.0, z_floor=None):
+        calls.append({'ticks': len(stream_ticks), 'z_floor': z_floor})
+        sm._post('pose', joints=stream_ticks[-1], timeout=2.0)
+    sm.stream = one_traced_stream
     try:
         U.main(bounds=FIXTURE_BOUNDS)
     finally:
-        U.state, sm._state, sm.stream, sm.sweep_z = (
-            old_u_state, old_sm_state, old_stream, old_sweep)
+        U.state, sm._state, sm.stream, sm.sweep_z, arm_lib.worker_submit_wait = (
+            old_u_state, old_sm_state, old_stream, old_sweep, old_submit)
     assert len(calls) == 1, calls
     assert calls[0]['ticks'] == len(ticks)
     print(f'  stream 호출 {len(calls)}회 · {calls[0]["ticks"]}틱: OK')
@@ -253,13 +315,20 @@ def main():
     # 실제 unfold 진입점에서도 teleop ON 통신 오류가 stop으로 이어지는지 확인한다.
     stop_ops = []
     old_u_state, old_u_post = U.state, U.post
-    old_post, old_sm_state, old_sleep = sm._post, sm._state, sm.time.sleep
+    old_post, old_sm_state, old_sleep, old_submit = (
+        sm._post, sm._state, sm.time.sleep, arm_lib.worker_submit_wait)
     U.state = lambda: fake
     U.post = lambda op, **kw: stop_ops.append(op) or {'ok': True}
     sm._post, sm._state = profile_on_fail, stream_state
     sm.time.sleep = lambda _: None
     sm.sweep_z = lambda _ticks: -0.03
     sm.fk_z = lambda _pose: -0.03
+    def unfold_profile_fail(op, **_kwargs):
+        if op == 'mission_hold':
+            return {'id': 'hold-1', 'op': op, 'status': 'completed',
+                    'expected_duration_s': 0.1, 'applied_action': {'held': True}}
+        raise arm_lib.WorkerCommandError('가짜 프로파일 전환 실패')
+    arm_lib.worker_submit_wait = unfold_profile_fail
     try:
         try:
             U.main(bounds=FIXTURE_BOUNDS)
@@ -270,6 +339,7 @@ def main():
         U.state, U.post = old_u_state, old_u_post
         sm._post, sm._state, sm.time.sleep, sm.sweep_z, sm.fk_z = (
             old_post, old_sm_state, old_sleep, old_sweep, old_fk_z)
+        arm_lib.worker_submit_wait = old_submit
     assert stop_ops == ['stop'], stop_ops
 
     # 마지막 명령 뒤 수렴을 기다리는 동안 토크가 꺼져도 성공으로 끝내면 안 된다.
@@ -291,14 +361,22 @@ def main():
                 'pos': dict(PARKED), 'log': []}
 
     old_u_state, old_u_post = U.state, U.post
-    old_post, old_sm_state, old_sleep, old_sweep, old_fk_z = (
-        sm._post, sm._state, sm.time.sleep, sm.sweep_z, sm.fk_z)
+    old_post, old_sm_state, old_sleep, old_sweep, old_fk_z, old_submit = (
+        sm._post, sm._state, sm.time.sleep, sm.sweep_z, sm.fk_z,
+        arm_lib.worker_submit_wait)
     U.state = lambda: fake
     U.post = lambda op, **kw: stop_ops.append(op) or {'ok': True}
     sm._post, sm._state = successful_post, torque_drop_state
     sm.time.sleep = lambda _: None
     sm.sweep_z = lambda _ticks: -0.03
     sm.fk_z = lambda _pose: -0.03
+    def unfold_success(op, **kw):
+        if op == 'teleop_profile':
+            sim['teleop'] = bool(kw['on'])
+        return {'id': f'cmd-{live_reads}-{op}', 'op': op,
+                'status': 'completed', 'expected_duration_s': 0.1,
+                'applied_action': {'fixture': True}}
+    arm_lib.worker_submit_wait = unfold_success
     try:
         try:
             U.main(bounds=FIXTURE_BOUNDS)
@@ -309,12 +387,50 @@ def main():
         U.state, U.post = old_u_state, old_u_post
         sm._post, sm._state, sm.time.sleep, sm.sweep_z, sm.fk_z = (
             old_post, old_sm_state, old_sleep, old_sweep, old_fk_z)
+        arm_lib.worker_submit_wait = old_submit
     assert live_reads >= 3, live_reads
     assert stop_ops == ['stop'], stop_ops
     print('  pose/프로파일 실패를 RuntimeError로 통일 · 프로파일 OFF · '
           '최종 수렴 토크 감시 · stop 1회: OK')
 
-    print('\n통과 — unfold 경로·연속 이동 6항목')
+    print('\n⑦ 최종 수렴 — 서버 4° step 제한 뒤 목표까지 따라잡기')
+    target = {j: 0.0 for j in sm.J5}
+    target['wrist_flex'] = 12.0
+    sim_pose = dict(target, wrist_flex=0.0)
+    sim = {'teleop': False}
+    pose_targets = []
+
+    def step_limited_post(op, timeout=3.0, **kw):
+        if op == 'teleop_profile':
+            sim['teleop'] = bool(kw['on'])
+        elif op == 'pose':
+            pose_targets.append(dict(kw['joints']))
+            for joint, wanted in kw['joints'].items():
+                delta = max(-4.0, min(4.0, wanted - sim_pose[joint]))
+                sim_pose[joint] += delta
+        return {'ok': True, 'status': 'completed'}
+
+    def step_limited_state(timeout=3.0):
+        return {'teleop': sim['teleop'], 'torque': True,
+                'pos': dict(sim_pose), 'log': []}
+
+    old_post, old_sm_state, old_sleep, old_fk_z = (
+        sm._post, sm._state, sm.time.sleep, sm.fk_z)
+    sm._post, sm._state = step_limited_post, step_limited_state
+    sm.time.sleep = lambda _seconds: None
+    sm.fk_z = lambda _pose: 0.1
+    try:
+        reached = sm.stream([target], hz=1000.0)
+    finally:
+        sm._post, sm._state, sm.time.sleep, sm.fk_z = (
+            old_post, old_sm_state, old_sleep, old_fk_z)
+    assert reached['wrist_flex'] >= 9.5, reached
+    assert len(pose_targets) >= 3, pose_targets
+    assert sim['teleop'] is False
+    print(f'  wrist_flex 0° → {reached["wrist_flex"]:.1f}° · '
+          f'4° 제한 명령 {len(pose_targets)}회: OK')
+
+    print('\n통과 — unfold 경로·연속 이동 7항목')
 
 
 if __name__ == '__main__':
